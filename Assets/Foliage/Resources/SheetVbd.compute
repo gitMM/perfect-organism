@@ -1,0 +1,300 @@
+// Implicit Euler vertex block descent following Chen et al. (2024).
+// Spring and signed dihedral energy models follow Newton's particle VBD kernels.
+#pragma kernel Predict
+#pragma kernel Relax
+#pragma kernel Measure
+#pragma kernel Finish
+#pragma kernel DetectContacts
+#pragma kernel Snapshot
+
+struct Element { int4 ids; float rest; float angle; float vein; float materialScale; int extra; int kind; float4 reference; };
+struct Sample { float3 position; float3 velocity; float3 force; float2 energy; float3 grabForce; };
+StructuredBuffer<Element> Elements;
+StructuredBuffer<int> Offsets, Incident, Groups;
+StructuredBuffer<float> Mass;
+RWStructuredBuffer<float3> X, Old, Inertia, Velocity;
+#include "PrimitiveContact.hlsl"
+RWStructuredBuffer<Sample> Samples;
+RWStructuredBuffer<float> Residual;
+RWStructuredBuffer<float2> MotionStats;
+int Count, Group, Sweep, GrabEnabled, WarmStartVelocity, PhysicalNodes;
+int4 GrabIds;
+struct SelfRow { int4 ids; float4 weights; float3 normal; float distance; };
+StructuredBuffer<SelfRow> SelfRows;
+StructuredBuffer<int> SelfIndices,SelfOffsets;
+RWStructuredBuffer<float3> SelfPositions;
+int HasSelfContact;
+[numthreads(64,1,1)]
+void Snapshot(uint id:SV_DispatchThreadID)
+{
+    if(id<(uint)Count)SelfPositions[id]=X[id];
+}
+float3 Weights, Target;
+float Dt, Stretch, Bend, DampingTime, GrabK, GrabD, GrabLimit, VeinRatio, GravityScale, DragRate;
+float RodStiffness;
+static const float3 Gravity=float3(0,-9.81,0);
+static const float3x3 I=float3x3(1,0,0,0,1,0,0,0,1);
+float3x3 Outer(float3 v) { return float3x3(v.x*v,v.y*v,v.z*v); }
+
+StructuredBuffer<float4> DatPlanes;
+StructuredBuffer<int> DatOffsets;
+int UseDat;
+float DatTravel;
+float3 BoundMotion(int v,float3 delta)
+{
+    if(UseOgc==0 && UseDat==0)return delta;
+    float3 requested=delta;
+    float radius=1e20;
+    if(UseDat!=0 && v<PhysicalNodes)
+    {
+        // Bounds are measured from this tick's detection positions, including
+        // motion already consumed by prediction and earlier color sweeps.
+        float3 used=X[v]-Old[v];
+        delta=clamp(used+delta,-DatTravel,DatTravel)-used;
+        radius=DatTravel;
+        int begin=DatOffsets[v],end=DatOffsets[v+1];
+        for(int i=begin;i<end;i++)
+        {
+            float4 p=DatPlanes[i];
+            float slack=max(0,p.w-dot(p.xyz,used));
+            delta-=max(0,dot(p.xyz,delta)-slack)*p.xyz;
+            radius=min(radius,slack);
+        }
+        // Projection onto one plane can violate another. Clip the final
+        // segment against every half-space and the broad-phase travel box.
+        delta=clamp(used+delta,-DatTravel,DatTravel)-used;
+        float t=1;
+        for(int j=begin;j<end;j++)
+        {
+            float4 p=DatPlanes[j];float closing=dot(p.xyz,delta);
+            if(closing>0)t=min(t,max(0,p.w-dot(p.xyz,used))/closing);
+        }
+        delta*=t;
+    }
+    if(UseOgc!=0)
+    {
+        float limit=1e20;
+        for(int j=Offsets[v];j<Offsets[v+1];j++)
+        {
+            Element e=Elements[Incident[j]];
+            if(e.kind==4)for(int wall=0;wall<WallCount;wall++)
+                limit=min(limit,Contacts[(int)e.rest+wall*FeatureCount].clearance);
+        }
+        float obstacleRadius=.45*(limit>0?limit:.001);
+        radius=min(radius,obstacleRadius);
+        delta*=min(1,obstacleRadius/max(length(delta),1e-12));
+    }
+    float2 previous=MotionStats[v];
+    MotionStats[v]=float2(min(previous.x,radius),max(previous.y,length(requested-delta)));
+    return delta;
+}
+
+[numthreads(64,1,1)]
+void Predict(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count) return;
+    if(UseOgc!=0 || UseDat!=0)MotionStats[id]=float2(1e20,0);
+    Old[id]=X[id];
+    float3 y=X[id]+Dt*Velocity[id]+Dt*Dt*Gravity*(id<(uint)PhysicalNodes?GravityScale:0);
+    Inertia[id]=Groups[id]<0 ? X[id] : y;
+    // Gravity stays in the objective; extrapolating velocity on blades speeds bending waves.
+    if(WarmStartVelocity!=0 && Groups[id]>=0) X[id]+=BoundMotion(id,Dt*Velocity[id]);
+}
+
+float Angle(float3 a,float3 b,float3 c,float3 d,out float3 ga,out float3 gb,out float3 gc)
+{
+    float3 e=d-c, n=cross(c-a,d-a), m=cross(d-b,c-b);
+    float len=length(e), n2=dot(n,n), m2=dot(m,m);
+    ga=gb=gc=0;
+    if(len<1e-6 || min(n2,m2)<1e-4*pow(len,4)) return 0;
+    ga=-len*n/n2; gb=-len*m/m2;
+    gc=(dot(a-d,e)*ga+dot(b-d,e)*gb)/(len*len);
+    return atan2(dot(cross(n,m),e/len),dot(n,m));
+}
+
+float3x3 Skew(float3 a){return float3x3(0,-a.z,a.y,a.z,0,-a.x,-a.y,a.x,0);}
+struct Frame { float3 x,y,z; float3x3 spin; };
+Frame MaterialFrame(int a,int b,int g,int v)
+{
+    Frame f;
+    float3 axis=X[b]-X[a], arm=X[g]-.5*(X[a]+X[b]);
+    float len=max(length(axis),1e-8);
+    f.z=axis/len;
+    float axial=dot(arm,f.z);
+    float3 radial=arm-axial*f.z;
+    float height=max(length(radial),1e-8);
+    f.x=radial/height; f.y=cross(f.z,f.x);
+    float along=((v==b?1:0)-(v==a?1:0))/len;
+    float mid=v==g?1:(v==a || v==b?-.5:0);
+    f.spin=along*Skew(f.z)+(mid-axial*along)/height*float3x3(f.z.x*f.y,f.z.y*f.y,f.z.z*f.y);
+    return f;
+}
+float3 World(Frame f,float3 local){return local.x*f.x+local.y*f.y+local.z*f.z;}
+float3 Rotate(float4 q,float3 v){return v+2*cross(q.xyz,cross(q.xyz,v)+q.w*v);}
+void VectorEnergy(float3 error,float3x3 J,float k,inout float3 force,inout float3x3 H)
+{
+    force-=k*mul(transpose(J),error);
+    H+=k*mul(transpose(J),J);
+}
+void RodEnergy(Element e,int v,inout float3 force,inout float3x3 H,inout float2 energy)
+{
+    int4 s=e.ids;
+    Frame parent=MaterialFrame(s.x,s.y,s.z,v);
+    float k=e.rest*RodStiffness;
+    if(e.kind==3)
+    {
+        float3 offset=World(parent,e.reference.xyz);
+        float3 err=X[s.w]-X[s.y]-offset;
+        float3x3 J=((v==s.w?1:0)-(v==s.y?1:0))*I+mul(Skew(offset),parent.spin);
+        VectorEnergy(err,J,k,force,H);
+        energy.x+=.125*k*dot(err,err);
+        return;
+    }
+    Frame child=MaterialFrame(s.y,s.w,e.extra,v);
+    // Chordal material-frame energy. Small-angle EI/L bending and 0.7 EI/L torsion.
+    [unroll] for(int j=0;j<3;j++)
+    {
+        float3 local=float3(j==0,j==1,j==2);
+        float3 refAxis=World(parent,Rotate(e.reference,local));
+        float3 axis=World(child,local);
+        float3 err=axis-refAxis;
+        float3x3 J=mul(Skew(refAxis),parent.spin)-mul(Skew(axis),child.spin);
+        float w=k*(j==2?.65:.35);
+        VectorEnergy(err,J,w,force,H);
+        energy.y+=.1*w*dot(err,err);
+    }
+}
+void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3 grab)
+{
+    float3 p=X[v];
+    float drag=Mass[v]*DragRate/Dt;
+    force=-drag*(p-Old[v]); H=(Mass[v]/(Dt*Dt)+drag)*I; energy=0; grab=0;
+    if(HasSelfContact!=0)
+    {
+        for(int k=SelfOffsets[v];k<SelfOffsets[v+1];k++)
+        {
+            SelfRow row=SelfRows[SelfIndices[k]];
+            float3 delta=0;float weight=0;
+            [unroll] for(int i=0;i<4;i++)
+            {
+                delta+=row.weights[i]*SelfPositions[row.ids[i]];
+                if(row.ids[i]==v)weight+=row.weights[i];
+            }
+            delta+=weight*(p-SelfPositions[v]);
+            float depth=row.distance-dot(delta,row.normal);
+            if(depth<=0)continue;
+            force+=ContactK*weight*depth*row.normal;
+            // Sum of absolute interpolation weights is two. This diagonal
+            // majorizer stabilizes simultaneous updates across dynamic contacts.
+            H+=2*ContactK*abs(weight)*Outer(row.normal);
+        }
+    }
+    for(int j=Offsets[v];j<Offsets[v+1];j++)
+    {
+        Element elem=Elements[Incident[j]];
+        if(elem.kind==4)
+        {
+            if(Shape==0)continue;
+            for(int wall=0;wall<WallCount;wall++)
+            {
+                Contact hit=Contacts[(int)elem.rest+wall*FeatureCount];
+                if(hit.depth<=0)continue;
+                int3 ids=elem.ids.xyz;
+                float3 w=hit.weights;
+                float3 pos=w.x*X[ids.x]+w.y*X[ids.y]+w.z*X[max(ids.z,0)];
+                float remaining=hit.depth-dot(pos-hit.witness,hit.normal);
+                if(remaining<=0)continue;
+                float weight=v==ids.x?w.x:v==ids.y?w.y:w.z;
+                float magnitude=ContactK*remaining, curvature=ContactK;
+                if(UseOgc!=0 && remaining>.5*ContactOffset)
+                {
+                    float gap=ContactOffset-remaining;
+                    float safeGap=max(gap,.001*ContactOffset);
+                    float ratio=.5*ContactOffset/safeGap;
+                    curvature=ContactK*ratio*ratio;
+                    magnitude=curvature*(safeGap+max(0,safeGap-gap));
+                }
+                force+=magnitude*weight*hit.normal;
+                H+=curvature*weight*weight*Outer(hit.normal);
+            }
+            continue;
+        }
+        if(elem.kind>=2){RodEnergy(elem,v,force,H,energy);continue;}
+        int4 s=elem.ids;
+        float k,delta,change;
+        float3 grad;
+        if(s.z<0)
+        {
+            int other=v==s.x?s.y:s.x;
+            float3 edge=p-X[other];
+            float len=max(length(edge),1e-8);
+            grad=edge/len;
+            k=elem.kind==1?RodStiffness*elem.angle:Stretch*elem.materialScale*lerp(1,VeinRatio,elem.vein);
+            delta=len-elem.rest;
+            change=len-length(Old[v]-Old[other]);
+            // Keep the tensile geometric stiffness; project negative compression curvature to zero.
+            H+=k*max(0,delta/len)*(I-Outer(grad));
+            energy.x+=.25*k*delta*delta;
+        }
+        else
+        {
+            float3 a,b,c;
+            delta=Angle(X[s.x],X[s.y],X[s.z],X[s.w],a,b,c);
+            grad=v==s.x?a:v==s.y?b:v==s.z?c:-a-b-c;
+            float oldAngle=Angle(Old[s.x],Old[s.y],Old[s.z],Old[s.w],a,b,c);
+            change=delta-oldAngle;
+            if(abs(change)>3.14159265) change-=sign(change)*6.2831853;
+            delta-=elem.angle;
+            if(abs(delta)>3.14159265) delta-=sign(delta)*6.2831853;
+            k=Bend*elem.rest*elem.materialScale*lerp(1,VeinRatio,elem.vein);
+            energy.y+=.125*k*delta*delta;
+        }
+        float viscous=k*DampingTime/Dt;
+        force-=(k*delta+viscous*change)*grad;
+        H+=(k+viscous)*Outer(grad);
+    }
+    if(GrabEnabled!=0 && any(GrabIds.xyz==v))
+    {
+        float w=GrabIds.x==v?Weights.x:GrabIds.y==v?Weights.y:Weights.z;
+        float3 attachment=0,oldPoint=0;
+        [unroll] for(int i=0;i<3;i++)
+        {
+            attachment+=Weights[i]*X[GrabIds[i]];
+            oldPoint+=Weights[i]*Old[GrabIds[i]];
+        }
+        float3 raw=GrabK*(Target-attachment)-GrabD*(attachment-oldPoint)/Dt;
+        float size=max(length(raw),1e-12);
+        float cap=min(1,GrabLimit/size);
+        grab=w*cap*raw;
+        force+=grab;
+        H+=w*w*(GrabK+GrabD/Dt)*cap*(size>GrabLimit?I-Outer(raw/size):I);
+    }
+}
+[numthreads(64,1,1)]
+void Relax(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count || Groups[id]!=Group) return;
+    float3 f,g; float2 energy; float3x3 H;
+    Evaluate(id,f,H,energy,g);
+    f+=Mass[id]*(Inertia[id]-X[id])/(Dt*Dt);
+    float3 a=cross(H[1],H[2]), b=cross(H[2],H[0]), c=cross(H[0],H[1]);
+    X[id]+=BoundMotion(id,float3(dot(a,f),dot(b,f),dot(c,f))/max(dot(H[0],a),1e-20));
+}
+[numthreads(64,1,1)]
+void Measure(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count) return;
+    float3 f,grab; float2 energy; float3x3 H;
+    Evaluate(id,f,H,energy,grab);
+    float3 r=f+Mass[id]*(Inertia[id]-X[id])/(Dt*Dt);
+    Residual[Sweep*Count+id]=Groups[id]<0?0:length(r);
+    Sample s;
+    s.position=X[id]; s.velocity=(X[id]-Old[id])/Dt;
+    s.force=f+Mass[id]*Gravity*(id<(uint)PhysicalNodes?GravityScale:0); s.energy=energy; s.grabForce=grab;
+    Samples[id]=s;
+}
+[numthreads(64,1,1)]
+void Finish(uint id:SV_DispatchThreadID)
+{
+    if(id<(uint)Count) Velocity[id]=(X[id]-Old[id])/Dt;
+}
