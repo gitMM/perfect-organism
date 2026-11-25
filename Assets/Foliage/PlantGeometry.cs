@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -46,10 +46,16 @@ namespace Foliage
     // Rods and shell faces index the same nodes. A leaf base is its stalk's end node.
     public sealed class PlantGeometry
     {
-        public struct Rod { public int a, b, part; public float radius,collisionRadius; }
+        public struct Rod { public int a, b, part; public float radius,collisionRadius,woodRigidityGain; }
         public struct Face { public int a, b, c, part; }
         public struct SkinFace { public int a, b, c, rod, face; }
         public readonly List<Vector3> nodes = new();
+        // A generated spray owns contiguous particles and rods. Its attachment stays on the skeleton.
+        internal struct TwigCluster
+        {
+            public int anchor,firstNode,endNode,firstRod,endRod;
+        }
+        internal readonly List<TwigCluster> twigClusters=new();
         public readonly List<Rod> rods = new();
         public readonly List<Face> faces = new();
         public readonly List<int> joints = new();
@@ -67,6 +73,9 @@ namespace Foliage
         public int islands { get; private set; }
         internal int[] component;
         internal readonly List<int> rootNodes=new();
+        internal bool distributedStemSupport=true;
+        internal readonly List<int> groundPins=new();
+        internal int fixedCollarVertices;
         internal int leavesPerPlant;
         internal int coarsePlants;
         internal int PlantOfPart(int part)=>leavesPerPlant==0?0:part<=0?-part:(part-1)/(2*leavesPerPlant);
@@ -75,7 +84,7 @@ namespace Foliage
         public static string Part(int id) => id <= 0 ? (id==0?"Stem":"Stem "+(1-id)) :
             ((id % 2 == 1 ? "Stalk " : "Leaf ") + ((id + 1) / 2));
 
-        int Node(Vector3 p) { nodes.Add(p); thicknessRatio.Add(1f); return nodes.Count - 1; }
+        internal int Node(Vector3 p) { nodes.Add(p); thicknessRatio.Add(1f); return nodes.Count - 1; }
         int Vertex(Vector3 p, Color color,Vector2 uv=default)
         {
             skin.Add(p);
@@ -88,7 +97,7 @@ namespace Foliage
         }
 
         // Continuous rings at joints along each curved stem/stalk.
-        void Tube(List<int> path, int part, float radius, float taper,int sides=8)
+        internal void Tube(List<int> path, int part, float radius, float taper,int sides=8)
         {
             if(reducedTubes)sides=part<=0?6:4;
             int start = skin.Count;
@@ -133,7 +142,7 @@ namespace Foliage
         bool reducedTubes;
         float bladeTone;
 
-        void Blade(int root, Vector3 direction, float length, PlantSettings s, int part,BladeSpawnClearance placement)
+        internal void Blade(int root, Vector3 direction, float length, PlantSettings s, int part,BladeSpawnClearance placement)
         {
             int firstFace=faces.Count,firstNode=nodes.Count,firstVertex=skin.Count;
             Vector3 side = Quaternion.AngleAxis(18f*Mathf.Sin(9*nodes[root].y+7*direction.z),direction)*Vector3.Cross(Vector3.up, direction).normalized;

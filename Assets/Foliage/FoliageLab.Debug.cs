@@ -44,6 +44,19 @@ namespace Foliage
             GUI.color=Color.white;
             GUILayout.BeginArea(new Rect(0,0,PanelWidth,Screen.height/scale),GUI.skin.box);
             GUILayout.Label("<b>FOLIAGE  /  TEST SCENE</b>");
+            if(jungleFig)
+            {
+                GUILayout.Label("Jungle fig   /   Seed " + jungleFig.seed);
+                if(GUILayout.Button(jungleFig.simulationPaused?"Resume physics":"Pause physics"))
+                    jungleFig.simulationPaused=!jungleFig.simulationPaused;
+                jungleFig.SetDebugVisible(GUILayout.Toggle(jungleFig.DebugVisible,"Tree solver debug view"));
+                if(jungleFig.DebugVisible)GUILayout.Label(FigBranchInstance.DebugLegend);
+                if(GUILayout.Button("Frame tree"))FrameFig();
+                if(GUILayout.Button("Back to lab"))CloseJungleFig();
+                GUILayout.Label("Left drag a leaf or branch to pull.\nRight drag to orbit. Scroll to zoom.\nMiddle drag to pan.");
+                GUILayout.EndArea();GUI.matrix=Matrix4x4.identity;return;
+            }
+            if(jungleFigPrefab && GUILayout.Button("Jungle fig")){OpenJungleFig();GUIUtility.ExitGUI();}
             int current=Sheet==null?0:Sheet.plant!=null?3:Sheet.leaf==null?1:2;
             int workspace=GUILayout.Toolbar(current,new[]{"Plant","Sheet","Leaf","Stems"});
             if(workspace!=current)
@@ -170,7 +183,7 @@ namespace Foliage
         static void Outline(Vector3 a,Vector3 b,Vector3 c) { Line(a,b); Line(b,c); Line(c,a); }
         void OnRenderObject()
         {
-            if(!debugRendering || Camera.current!=view || Geometry==null) return;
+            if(jungleFig || !debugRendering || Camera.current!=view || Geometry==null) return;
             if(Sheet!=null) { DrawSheetOverlay(); return; }
             var g=Geometry;
             float r=.009f*debugScale;

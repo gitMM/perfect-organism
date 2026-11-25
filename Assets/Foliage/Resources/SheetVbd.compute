@@ -4,10 +4,23 @@
 #pragma kernel Predict
 #pragma kernel CacheRestMotion
 #pragma kernel Relax
+#pragma kernel FigClearTiles
+#pragma kernel FigCollectTiles
+#pragma kernel FigClusterRelax FIG_SELECTIVE
+#pragma kernel UpdateFigDual
+#pragma kernel FigWakeClusters
+#pragma kernel FigTrialEnergy
+#pragma kernel FigChooseTrial
+#pragma kernel FigApplyTrial
+#pragma kernel FigAttachmentMass
+#pragma kernel FigFollowAttachment
 #pragma kernel RelaxPlant LOCAL_PLANT
 #pragma kernel RelaxCutPlant LOCAL_PLANT PACKED_PLANT
 #pragma kernel Measure
 #pragma kernel Finish
+#pragma kernel FigParticleSummary
+#pragma kernel FigBoughSummary
+#pragma kernel FigClusterBoughSummary FIG_COUNT_CLUSTERS
 #pragma kernel DetectContacts
 #pragma kernel Snapshot
 #pragma kernel DeformSkin
@@ -37,7 +50,7 @@ void Snapshot(uint id:SV_DispatchThreadID)
 }
 float3 Weights, Target;
 float Dt, Stretch, Bend, DampingTime, GrabK, GrabD, GrabLimit, VeinRatio, GravityScale, DragRate;
-float RodStiffness;
+float RodStiffness, VelocityGuess;
 static const float3 Gravity=float3(0,-9.81,0);
 static const float3x3 I=float3x3(1,0,0,0,1,0,0,0,1);
 float3x3 Outer(float3 v) { return float3x3(v.x*v,v.y*v,v.z*v); }
@@ -168,7 +181,7 @@ void Predict(uint id:SV_DispatchThreadID)
     Inertia[id]=Groups[id]<0 ? X[id] : y;
     // Gravity stays in the objective; extrapolating velocity on blades speeds bending waves.
     if(WarmStartVelocity!=0 && Groups[id]>=0 && (PlayerOrbit==0 || free || RodCounts[id]==0))
-        X[id]+=BoundMotion(id,free?(y-X[id])/(1+Dt*DragRate):Dt*Velocity[id]);
+        X[id]+=BoundMotion(id,free?(y-X[id])/(1+Dt*DragRate):VelocityGuess*Dt*Velocity[id]);
 }
 
 float Angle(float3 a,float3 b,float3 c,float3 d,out float3 ga,out float3 gb,out float3 gc)
@@ -224,6 +237,40 @@ void VectorEnergy(float3 error,float3x3 J,float k,inout float3 force,inout float
     force-=k*mul(transpose(J),error);
     H+=k*mul(transpose(J),J);
 }
+// Hard material-frame joints use the AVBD warm start, stabilized error and
+// adaptive penalty. Each chord has its own world-space multiplier.
+struct FigAxisState { float3 lambda; float penalty; float3 initial; float unused; };
+StructuredBuffer<FigAxisState> FigDual;
+RWStructuredBuffer<FigAxisState> FigDualOut;
+StructuredBuffer<int> FigJointIds;
+int FigJointCount,FigBeginStep,FigLoadReleased;
+static const float FigAlpha=.95,FigDecay=.98;
+[numthreads(64,1,1)]
+void UpdateFigDual(uint joint:SV_DispatchThreadID)
+{
+    if(joint>=(uint)FigJointCount)return;
+    Element e=Elements[FigJointIds[joint]];
+    Frame parent=MaterialFrame(e.ids.x,e.ids.y,e.ids.z,-1);
+    Frame child=MaterialFrame(e.ids.y,e.ids.w,e.extra,-1);
+    for(int j=0;j<3;j++){
+        float3 axis=float3(j==0,j==1,j==2);
+        float3 error=World(child,axis)-World(parent,Rotate(e.reference,axis));
+        uint slot=3*joint+j;
+        FigAxisState state=FigDualOut[slot];
+        float scale=e.rest*RodStiffness*(j==2?.65:.35);
+        if(FigBeginStep!=0){
+            state.initial=error;
+            // The previous step's reaction includes the grab that just disappeared.
+            state.lambda=FigLoadReleased!=0?0:state.lambda*(FigAlpha*FigDecay);
+            state.penalty=max(scale,state.penalty*FigDecay);
+        }else{
+            error-=FigAlpha*state.initial;
+            state.lambda+=state.penalty*error;
+            state.penalty=min(4*scale,state.penalty+scale*length(error));
+        }
+        FigDualOut[slot]=state;
+    }
+}
 void RodEnergy(Element e,int v,inout float3 force,inout float3x3 H,inout float2 energy)
 {
     int4 s=e.ids;
@@ -248,10 +295,194 @@ void RodEnergy(Element e,int v,inout float3 force,inout float3x3 H,inout float2 
         float3 err=axis-refAxis;
         float3x3 J=mul(Skew(refAxis),parent.spin)-mul(Skew(axis),child.spin);
         float w=k*(j==2?.65:.35);
-        VectorEnergy(err,J,w,force,H);
+        if(e.materialScale>0){
+            FigAxisState state=FigDual[3*((int)e.materialScale-1)+j];
+            float3 stabilized=err-FigAlpha*state.initial;
+            force-=mul(transpose(J),state.lambda+state.penalty*stabilized);
+            H+=state.penalty*mul(transpose(J),J);
+        }else VectorEnergy(err,J,w,force,H);
         energy.y+=.1*w*dot(err,err);
     }
 }
+StructuredBuffer<int> FigOwner,FigHead;
+StructuredBuffer<int4> FigAnchor,FigRange;
+StructuredBuffer<float> FigLoad;
+// Relax, follow and summary only read this buffer. Only the wake pass needs a UAV.
+StructuredBuffer<int> FigState;
+RWStructuredBuffer<int> FigNextState;
+RWStructuredBuffer<float> FigEffectiveMass;
+int FigGrabNode,FigFullSweeps;
+float3x3 AttachmentAxes(float3 a,float3 b,float3 director)
+{
+    float3 z=normalize(b-a),y=normalize(cross(z,director-.5*(a+b)));
+    return float3x3(cross(y,z),y,z);
+}
+StructuredBuffer<float3> FigRest;
+// A single coarse search direction spans the whole rooted bough. Local vertex
+// sweeps alone propagate long-wavelength recovery only one neighborhood at a time.
+// Test the actual incremental objective before accepting a trial.
+float3 FigTrialPoint(int v,float t){return lerp(X[v],FigRest[v],t);}
+float FigElementObjective(uint id,Element e,float t)
+{
+    int4 v=e.ids;
+    float3 a=FigTrialPoint(v.x,t),b=FigTrialPoint(v.y,t);
+    if(e.kind<=1){
+        float value,k,delta;
+        if(v.z<0){
+            value=length(a-b);
+            k=e.kind==1?RodStiffness*e.angle:Stretch*e.materialScale*lerp(1,VeinRatio,e.vein);
+            delta=value-e.rest;
+        }else{
+            float3 ga,gb,gc;
+            value=Angle(a,b,FigTrialPoint(v.z,t),FigTrialPoint(v.w,t),ga,gb,gc);
+            k=Bend*e.rest*e.materialScale*lerp(1,VeinRatio,e.vein);
+            delta=value-e.angle;
+            if(abs(delta)>3.14159265)delta-=sign(delta)*6.2831853;
+        }
+        float change=value-OldMeasure[id];
+        if(v.z>=0 && abs(change)>3.14159265)change-=sign(change)*6.2831853;
+        float excess=e.kind==1 && e.materialScale>0?max(0,delta-.02*e.rest):0;
+        return .5*k*(delta*delta+100*excess*excess+DampingTime/Dt*change*change);
+    }
+    float3 d=FigTrialPoint(v.w,t);
+    float3x3 parent=AttachmentAxes(a,b,FigTrialPoint(v.z,t));
+    float k=e.rest*RodStiffness;
+    if(e.kind==3){
+        float3 error=d-b-mul(e.reference.xyz,parent);
+        return .5*k*dot(error,error);
+    }
+    float3x3 child=AttachmentAxes(b,d,FigTrialPoint(e.extra,t));
+    float energy=0;
+    for(int j=0;j<3;j++){
+        float3 axis=float3(j==0,j==1,j==2);
+        float3 error=child[j]-mul(Rotate(e.reference,axis),parent);
+        if(e.materialScale>0){
+            FigAxisState state=FigDual[3*((int)e.materialScale-1)+j];
+            error-=FigAlpha*state.initial;
+            energy+=dot(state.lambda,error)+.5*state.penalty*dot(error,error);
+        }else energy+=.5*k*(j==2?.65:.35)*dot(error,error);
+    }
+    return energy;
+}
+RWStructuredBuffer<float3> FigTrialGroups;
+RWStructuredBuffer<float> FigTrialFraction;
+int FigTrialGroupCount;
+groupshared float3 trialShared[128];
+float3 ReduceTrial(uint lane,float3 value)
+{
+    trialShared[lane]=value;
+    GroupMemoryBarrierWithGroupSync();
+    for(uint stride=64;stride>0;stride>>=1){
+        if(lane<stride)trialShared[lane]+=trialShared[lane+stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    return trialShared[0];
+}
+static const float3 FigFractions=float3(.0125,.06,.25);
+[numthreads(128,1,1)]
+void FigTrialEnergy(uint id:SV_DispatchThreadID,uint lane:SV_GroupIndex,uint3 group:SV_GroupID)
+{
+    float3 change=0;
+    if(id<(uint)StructuralCount){
+        Element e=Elements[id];
+        float current=FigElementObjective(id,e,0);
+        change=float3(FigElementObjective(id,e,FigFractions.x),
+                      FigElementObjective(id,e,FigFractions.y),
+                      FigElementObjective(id,e,FigFractions.z))-current;
+    }
+    if(id<(uint)Count){
+        float3 p=X[id],dir=FigRest[id]-p;
+        float drag=DragRate/Dt,invDt2=1/(Dt*Dt);
+        float gradient=dot(dir,(p-Inertia[id])*invDt2+(p-Old[id])*drag);
+        float curvature=dot(dir,dir)*(invDt2+drag);
+        change+=Mass[id]*FigFractions*(gradient+.5*FigFractions*curvature);
+    }
+    float3 total=ReduceTrial(lane,change);
+    if(lane==0)FigTrialGroups[group.x]=total;
+}
+[numthreads(128,1,1)]
+void FigChooseTrial(uint lane:SV_GroupIndex)
+{
+    float3 change=0;
+    for(uint i=lane;i<(uint)FigTrialGroupCount;i+=128)change+=FigTrialGroups[i];
+    float3 total=ReduceTrial(lane,change);
+    if(lane==0){
+        float best=min(0,min(total.x,min(total.y,total.z)));
+        FigTrialFraction[0]=best==0?0:best==total.z?FigFractions.z:best==total.y?FigFractions.y:FigFractions.x;
+    }
+}
+[numthreads(64,1,1)]
+void FigApplyTrial(uint id:SV_DispatchThreadID)
+{
+    if(id<(uint)Count && FigTrialFraction[0]>0)X[id]=FigTrialPoint(id,FigTrialFraction[0]);
+}
+
+groupshared uint figPeak[64];
+
+[numthreads(64,1,1)]
+void FigWakeClusters(uint3 group:SV_GroupID,uint lane:SV_GroupIndex)
+{
+    int cluster=group.x+1;
+    int4 anchor=FigAnchor[cluster],range=FigRange[cluster];
+    int previous=FigNextState[cluster];
+    // Relative endpoint/director speeds also catch a rotating attachment with a stationary centre.
+    float lever=max(.01,length(X[anchor.y]-X[anchor.x]));
+    float3 v=Velocity[anchor.y];
+    float angular=max(length(v-Velocity[anchor.x]),length(v-Velocity[anchor.z]))/lever;
+    float attachmentSpeed=length(v)+angular;
+    float activity=0;
+    if(previous>0 || FigFullSweeps!=0){
+        // Measure deformation in the parent frame so a rotated but relaxed twig may sleep.
+        float3x3 current=AttachmentAxes(X[anchor.x],X[anchor.y],X[anchor.z]);
+        float3x3 rest=AttachmentAxes(FigRest[anchor.x],FigRest[anchor.y],FigRest[anchor.z]);
+        float3x3 relative=mul(transpose(current),rest);
+        int nodes=range.y-range.x;
+        for(int i=lane;i<nodes+range.w-range.z;i+=64){
+            int id=i<nodes?range.x+i:range.z+i-nodes;
+            float3 error=(X[id]-X[anchor.y])-mul(relative,FigRest[id]-FigRest[anchor.y]);
+            activity=max(activity,max(dot(Velocity[id],Velocity[id])/(.04*.04),dot(error,error)/(.002*.002)));
+        }
+    }
+    figPeak[lane]=asuint(activity);
+    GroupMemoryBarrierWithGroupSync();
+    for(uint stride=32;stride>0;stride>>=1){
+        if(lane<stride)figPeak[lane]=max(figPeak[lane],figPeak[lane+stride]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if(lane==0){
+        bool pulled=false;
+        if(FigGrabNode>=0)pulled=FigOwner[FigGrabNode]==cluster;
+        bool wake=pulled || attachmentSpeed>.035;
+        // Allow sub-millimetre per-tick leaf vibrations to settle for 30 ticks.
+        bool moving=attachmentSpeed>.012 || asfloat(figPeak[0])>1;
+        FigNextState[cluster]=wake || ((previous>0 || FigFullSweeps!=0) && moving)?30:max(previous-1,0);
+    }
+}
+
+[numthreads(64,1,1)]
+void FigAttachmentMass(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count)return;
+    float m=Mass[id];
+    // The first half-segment already contributes its mass to the shared attachment.
+    for(int c=FigHead[id];c!=0;c=FigAnchor[c].w)if(FigState[c]==0)m+=FigLoad[c];
+    FigEffectiveMass[id]=m;
+}
+
+[numthreads(64,1,1)]
+void FigFollowAttachment(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count)return;
+    int c=FigOwner[id];
+    if(c==0 || FigState[c]>0)return;
+    int3 r=FigAnchor[c].xyz;
+    // Carry the last deformed pose through the frame change; Finish derives its wake velocity.
+    float3x3 before=AttachmentAxes(Old[r.x],Old[r.y],Old[r.z]);
+    float3x3 after=AttachmentAxes(X[r.x],X[r.y],X[r.z]);
+    float3 local=mul(before,Old[id]-Old[r.y]);
+    X[id]=Old[id]+((X[r.y]-Old[r.y])+mul(local,after-before));
+}
+
 void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3 grab)
 {
     float3 p=Position(v);
@@ -281,6 +512,10 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
     {
         int index=Incident[j];
         Element elem=Elements[index];
+        #ifdef FIG_SELECTIVE
+        // A sleeping child's inertia is on its attachment. Omit its internal elastic reactions.
+        if(FigOwner[v]==0 && FigState[FigOwner[elem.ids.w>=0?elem.ids.w:elem.ids.y]]==0)continue;
+        #endif
         if(elem.kind==4)
         {
             if(Shape==0)continue;
@@ -410,11 +645,50 @@ float3 RodStep(int v,float3 move)
     }
     return t*move;
 }
+// A tile is 64 consecutive nodes of one solver color. Compact once per
+// tick; each Gauss-Seidel sweep then launches only tiles containing live work.
+StructuredBuffer<int2> FigTileColors;
+RWByteAddressBuffer FigDispatchArgs;
+RWStructuredBuffer<uint> FigTileOut;
+StructuredBuffer<uint> FigTiles;
+int FigColorCount;
+groupshared uint liveTile;
 [numthreads(64,1,1)]
-void Relax(uint thread:SV_DispatchThreadID)
+void FigClearTiles(uint id:SV_DispatchThreadID)
 {
-    int id=GroupNodes[GroupStart+thread];
+    if(id<(uint)FigColorCount)FigDispatchArgs.Store3(id*12,uint3(0,1,1));
+}
+[numthreads(64,1,1)]
+void FigCollectTiles(uint id:SV_DispatchThreadID,uint3 group:SV_GroupID,uint lane:SV_GroupIndex)
+{
+    if(lane==0)liveTile=0;
+    GroupMemoryBarrierWithGroupSync();
+    int v=GroupNodes[id];
+    if(v>=0 && FigState[FigOwner[max(v,0)]]!=0)InterlockedOr(liveTile,1);
+    GroupMemoryBarrierWithGroupSync();
+    if(lane==0 && liveTile!=0){
+        int2 color=FigTileColors[group.x];
+        uint slot;
+        FigDispatchArgs.InterlockedAdd(color.x*12,1,slot);
+        FigTileOut[color.y+slot]=group.x;
+    }
+}
+[numthreads(64,1,1)]
+#ifdef FIG_SELECTIVE
+void FigClusterRelax(uint thread:SV_DispatchThreadID)
+#else
+void Relax(uint thread:SV_DispatchThreadID)
+#endif
+{
+    uint offset=GroupStart+thread;
+    #ifdef FIG_SELECTIVE
+    offset=64*FigTiles[offset/64]+thread%64;
+    #endif
+    int id=GroupNodes[offset];
     if(id<0)return;
+    #ifdef FIG_SELECTIVE
+    if(FigState[FigOwner[id]]==0)return;
+    #endif
     float3 f,g; float2 energy; float3x3 H;
     Evaluate(id,f,H,energy,g);
     f+=Mass[id]*(Inertia[id]-X[id])/(Dt*Dt);
@@ -469,6 +743,68 @@ void Measure(uint id:SV_DispatchThreadID)
 void Finish(uint id:SV_DispatchThreadID)
 {
     if(id<(uint)Count) Velocity[id]=(X[id]-Old[id])/Dt;
+}
+
+// Reduce all physical and director particles to one summary record per bough.
+struct FigSummary { float3 lo; float maxTravelSq; float3 hi; int invalid; int awakeTwigNodes; float maxRestErrorSq; };
+RWStructuredBuffer<FigSummary> FigSummaryOut;
+StructuredBuffer<FigSummary> FigSummaryIn;
+int FigGroupCount,FigClusterCount;
+groupshared FigSummary figShared[128];
+
+FigSummary EmptyFigSummary()
+{
+    FigSummary s;
+    s.lo=3.402823e38;s.hi=-s.lo;s.maxTravelSq=0;s.invalid=-1;s.awakeTwigNodes=0;s.maxRestErrorSq=0;
+    return s;
+}
+FigSummary MergeFig(FigSummary a,FigSummary b)
+{
+    a.lo=min(a.lo,b.lo);a.hi=max(a.hi,b.hi);
+    a.awakeTwigNodes+=b.awakeTwigNodes;
+    a.maxRestErrorSq=max(a.maxRestErrorSq,b.maxRestErrorSq);
+    a.maxTravelSq=max(a.maxTravelSq,b.maxTravelSq);a.invalid=max(a.invalid,b.invalid);
+    return a;
+}
+void WriteFigGroup(uint lane,uint group,FigSummary s)
+{
+    figShared[lane]=s;
+    GroupMemoryBarrierWithGroupSync();
+    for(uint stride=64;stride>0;stride>>=1){
+        if(lane<stride)figShared[lane]=MergeFig(figShared[lane],figShared[lane+stride]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if(lane==0)FigSummaryOut[group]=figShared[0];
+}
+[numthreads(128,1,1)]
+void FigParticleSummary(uint id:SV_DispatchThreadID,uint lane:SV_GroupIndex,uint3 group:SV_GroupID)
+{
+    FigSummary s=EmptyFigSummary();
+    if(id<(uint)Count){
+        float3 p=X[id],delta=p-Old[id];
+        Velocity[id]=delta/Dt;
+        float travel=dot(delta,delta);
+        if((asuint(travel)&0x7fffffff)>=0x7f800000)s.invalid=(int)id;
+        else {s.lo=p;s.hi=p;s.maxTravelSq=travel;s.maxRestErrorSq=dot(p-FigRest[id],p-FigRest[id]);}
+    }
+    WriteFigGroup(lane,group.x,s);
+}
+[numthreads(128,1,1)]
+#ifdef FIG_COUNT_CLUSTERS
+void FigClusterBoughSummary(uint lane:SV_GroupIndex)
+#else
+void FigBoughSummary(uint lane:SV_GroupIndex)
+#endif
+{
+    FigSummary s=EmptyFigSummary();
+    for(uint i=lane;i<(uint)FigGroupCount;i+=128)s=MergeFig(s,FigSummaryIn[i]);
+    #ifdef FIG_COUNT_CLUSTERS
+    for(uint c=lane+1;c<=(uint)FigClusterCount;c+=128){
+        int4 range=FigRange[c];
+        if(FigState[c]>0)s.awakeTwigNodes+=range.y-range.x+range.w-range.z;
+    }
+    #endif
+    WriteFigGroup(lane,0,s);
 }
 
 RWByteAddressBuffer SkinVertices;

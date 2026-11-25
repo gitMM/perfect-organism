@@ -9,7 +9,7 @@ using Unity.Jobs;
 
 namespace Foliage
 {
-    public sealed class VbdSheet : IDisposable
+    public sealed partial class VbdSheet : IDisposable
     {
         public const int Side=11, MaxSweeps=24;
         public int Count => rest.Length;
@@ -38,6 +38,10 @@ namespace Foliage
             public Vector2 energy;
             public Vector3 grabForce;
         }
+        readonly List<int> stiffFigJoints = new();
+        struct FigAxisState { public Vector4 multiplierAndPenalty, initialError; }
+        int figDualKernel;
+        ComputeBuffer figDual;
         struct Element { public int a,b,c,d; public float rest,angle,vein,materialScale; public int extra,kind; public Vector4 reference; }
         public readonly Vector3[] rest, positions;
         public readonly Sample[] samples;
@@ -57,7 +61,7 @@ namespace Foliage
         Action uploadTopology;
         readonly List<ComputeBuffer> buffers=new();
         int predict,relax,measure,finish;
-        ComputeBuffer x,velocity,sampleBuffer,residualBuffer;
+        ComputeBuffer x,oldPositions,velocity,sampleBuffer,residualBuffer;
         readonly float[] residualData;
         readonly int[] ids=new int[4];
         readonly int[] groupOffsets;
@@ -129,6 +133,7 @@ namespace Foliage
             {
                 foreach(var f in plant.geometry.faces) Face(f.a,f.b,f.c);
                 AddRods(plant,elements,incident,mass);
+                if(stiffFigJoints.Count>0)iterations=8;
                 for(int i=0;i<contact.features.Length;i++)
                 {
                     var f=contact.features[i]; int id=elements.Count;
@@ -152,6 +157,7 @@ namespace Foliage
             var clamped=new HashSet<int>();
             if(plant!=null)
             {
+                clamped.UnionWith(plant.geometry.groundPins);
                 var roots=plant.geometry.rootNodes;
                 for(int i=0;i<plant.parent.Length;i++)
                 {
@@ -181,10 +187,30 @@ namespace Foliage
             // Pack each color into whole thread groups, in topology order for coherent reads.
             groupOffsets=new int[colorCount+1];
             var groupNodes=new List<int>();
+            // Adjacent lanes solve similar stencils; no dependencies exist within a color.
+            int[] order=null;
+            if(plant?.geometry.twigClusters.Count>0){
+                order=new int[Count];
+                var keys=new long[Count];
+                for(int v=0;v<Count;v++){
+                    int frames=0,shellTerms=0;
+                    foreach(int id in incident[v]){
+                        var kind=elements[id].kind;
+                        if(kind==2 || kind==3)frames++;
+                        if(kind==0)shellTerms++;
+                    }
+                    order[v]=v;
+                    keys[v]=((long)frames<<48)+((long)shellTerms<<32)+v;
+                }
+                Array.Sort(keys,order);
+            }
             for(int group=0;group<colorCount;group++)
             {
                 groupOffsets[group]=groupNodes.Count;
-                for(int v=0;v<Count;v++)if(colors[v]==group)groupNodes.Add(v);
+                for(int i=0;i<Count;i++){
+                    int v=order==null?i:order[i];
+                    if(colors[v]==group)groupNodes.Add(v);
+                }
                 while(groupNodes.Count%64!=0)groupNodes.Add(-1);
             }
             groupOffsets[colorCount]=groupNodes.Count;
@@ -265,6 +291,7 @@ namespace Foliage
                 foreach(int kernel in kernels)
                 {
                     gpu.SetBuffer(kernel,name,buffer);
+                    if(kernel==relax && figClusterRelax>=0 && name!="Mass")gpu.SetBuffer(figClusterRelax,name,buffer);
                     if(kernel==relax && localPlants>0 && name!="GroupNodes")gpu.SetBuffer(localRelax,name,buffer);
                 }
                 return buffer;
@@ -274,6 +301,7 @@ namespace Foliage
                 if(!SystemInfo.supportsComputeShaders) throw new NotSupportedException("VBD requires compute shader support.");
                 gpu=UnityEngine.Object.Instantiate(Resources.Load<ComputeShader>("SheetVbd"));
                 predict=gpu.FindKernel("Predict"); relax=gpu.FindKernel("Relax");
+                if(plant?.geometry.twigClusters.Count>0)figClusterRelax=gpu.FindKernel("FigClusterRelax");
                 detect=gpu.FindKernel("DetectContacts");
                 cacheRestMotion=gpu.FindKernel("CacheRestMotion");
                 snapshot=gpu.FindKernel("Snapshot");
@@ -309,7 +337,7 @@ namespace Foliage
                     Buffer("FallMotion",fall.Length,16,fall,prepareFall,predict);
                     x=Buffer("X",Count,12,null,predict,relax,measure,finish,detect,snapshot,prepareFall);
                     Buffer("SelfPositions",Count,12,null,snapshot,relax,measure);
-                    selfContact=new PlantSelfContact(contact,Count,gpu,predict,relax,measure,localPlants>0?localRelax:-1,plant!=null && (plant.geometry.rootNodes.Count>=10 || plant.geometry.faces.Count>1000));
+                    selfContact=new PlantSelfContact(contact,Count,gpu,predict,relax,measure,localPlants>0?localRelax:figClusterRelax,plant!=null && (plant.geometry.rootNodes.Count>=10 || plant.geometry.faces.Count>1000));
                     int featureCount=contact?.features.Length??0;
                     Buffer("Features",Math.Max(1,featureCount),16,contact?.features,detect);
                     contactBuffer=Buffer("Contacts",Math.Max(1,featureCount*2),56,null,detect,predict,relax,measure);
@@ -323,20 +351,42 @@ namespace Foliage
                     gpu.SetInt("FeatureCount",featureCount);
                     gpu.SetFloat("ContactK",3200);
                     velocity=Buffer("Velocity",Count,12,null,predict,relax,finish,prepareFall);
-                    Buffer("Old",Count,12,null,predict,relax,measure,finish,cacheRestMotion);
-                    Buffer("Inertia",Count,12,null,predict,relax,measure);
-                    Buffer("Mass",Count,4,mass,relax,measure,prepareFall);
-                    Buffer("Elements",elements.Count,56,elements.ToArray(),predict,relax,measure,cacheRestMotion,prepareFall);
-                    Buffer("OldMeasure",Math.Max(1,structuralCount),4,null,cacheRestMotion,relax,measure);
+                    oldPositions=Buffer("Old",Count,12,null,predict,relax,measure,finish,cacheRestMotion);
+                    var inertia=Buffer("Inertia",Count,12,null,predict,relax,measure);
+                    var baseMass=Buffer("Mass",Count,4,mass,relax,measure,prepareFall);
+                    if(figClusterRelax>=0)BuildFigClusters(mass,baseMass);
+                    var elementBuffer=Buffer("Elements",elements.Count,56,elements.ToArray(),predict,relax,measure,cacheRestMotion,prepareFall);
+                    int jointCount=stiffFigJoints.Count;
+                    figDual=Buffer("FigDual",Math.Max(1,3*jointCount),32,null,relax,measure);
+                    if(jointCount>0){
+                        if(deferUpload)figDual.SetData(new FigAxisState[3*jointCount]);
+                        figDualKernel=gpu.FindKernel("UpdateFigDual");
+                        gpu.SetInt("FigJointCount",jointCount);
+                        Buffer("FigJointIds",jointCount,4,stiffFigJoints.ToArray(),figDualKernel);
+                        gpu.SetBuffer(figDualKernel,"FigDualOut",figDual);
+                        gpu.SetBuffer(figDualKernel,"Elements",elementBuffer);
+                        gpu.SetBuffer(figDualKernel,"X",x);
+                    }
+                    var oldMeasure=Buffer("OldMeasure",Math.Max(1,structuralCount),4,null,cacheRestMotion,relax,measure);
+                    if(figClusterRelax>=0){
+                        gpu.SetBuffer(figTrialEnergy,"Inertia",inertia);
+                        gpu.SetBuffer(figTrialEnergy,"Elements",elementBuffer);
+                        gpu.SetBuffer(figTrialEnergy,"FigDual",figDual);
+                        gpu.SetBuffer(figTrialEnergy,"OldMeasure",oldMeasure);
+                    }
                     gpu.SetInt("StructuralCount",structuralCount);
                     Buffer("RodCounts",Count,4,rodCounts,predict,relax);
                     Buffer("Offsets",offsets.Length,4,offsets,predict,relax,measure,prepareFall);
                     Buffer("Incident",flat.Count,4,flat.ToArray(),predict,relax,measure,prepareFall);
-                    Buffer("GroupNodes",Math.Max(1,groupNodes.Count),4,groupNodes.Count>0?groupNodes.ToArray():null,relax);
+                    var orderedNodes=Buffer("GroupNodes",Math.Max(1,groupNodes.Count),4,groupNodes.Count>0?groupNodes.ToArray():null,relax);
+                    if(figClusterRelax>=0)BuildFigTiles(orderedNodes);
                     Buffer("Groups",Count,4,colors,predict,relax,measure);
                     sampleBuffer=Buffer("Samples",Count,56,null,measure);
                     residualBuffer=Buffer("Residual",Count*MaxSweeps,4,null,measure);
                     gpu.SetInt("Count",Count);
+                    // A partial velocity guess limits overshoot of the eight-sweep fig solve.
+                    // Inertia still uses the entire velocity from the preceding tick.
+                    gpu.SetFloat("VelocityGuess",figClusterRelax>=0?.7f:1f);
                     gpu.SetInt("WarmStartVelocity",shell?1:0);
                     gpu.SetFloat("DragRate",plant!=null?6:shell?3:0);
                     gpu.SetInt("PhysicalNodes",plant?.geometry.nodes.Count??Count);
@@ -351,7 +401,7 @@ namespace Foliage
             var upload=uploadTopology;uploadTopology=null;
             upload();
         }
-        static void AddRods(RodPlant plant,List<Element> elements,List<int>[] incident,float[] mass)
+        void AddRods(RodPlant plant,List<Element> elements,List<int>[] incident,float[] mass)
         {
             var rods=plant.geometry.rods; var p=plant.rest;
             void Register(Element e)
@@ -374,12 +424,13 @@ namespace Foliage
                 mass[r.a]+=.5f*segmentMass; mass[r.b]+=.5f*segmentMass;
                 // Match polar inertia m*r²/2 at the director's numerical lever arm.
                 mass[g]=2*segmentMass*r.radius*r.radius/(len*len);
-                float axial=320000*area/len;
+                float woodRigidity=1+r.woodRigidityGain;
+                float axial=320000*woodRigidity*area/len;
                 Spring(r.a,r.b,axial,true);
                 Spring(r.a,g,axial*.45f); Spring(r.b,g,axial*.45f);
                 // Distributed elastic support in the rooted stem's material frame.
                 // Weight by segment length so coarse and detailed trunks have comparable support.
-                if(r.part<=0)
+                if(r.part<=0 && plant.geometry.distributedStemSupport)
                 {
                     if(plant.parent[i]<0 && plant.geometry.rootNodes.Contains(r.a))
                         rootedTrunk[r.b]=i;
@@ -398,8 +449,14 @@ namespace Foliage
                 Quaternion q=Quaternion.Inverse(plant.restFrames[parent])*plant.restFrames[i];
                 float dual=(Vector3.Distance(p[previous.a],p[previous.b])+len)*.5f;
                 float flexuralRigidity=(r.part<=0?5.8f:.24f)*Mathf.Pow(r.radius/(r.part<=0?.028f:.009f),4);
+                // Kind 2 uses materialScale as a one-based AVBD joint slot (zero for elastic rods).
+                int jointSlot=0;
+                if(r.woodRigidityGain>=1f){
+                    stiffFigJoints.Add(elements.Count);
+                    jointSlot=stiffFigJoints.Count;
+                }
                 Register(new Element{kind=2,a=previous.a,b=r.a,c=plant.Ghost(parent),d=r.b,extra=g,
-                    rest=flexuralRigidity/dual,reference=new Vector4(q.x,q.y,q.z,q.w)});
+                    materialScale=jointSlot,rest=woodRigidity*flexuralRigidity/dual,reference=new Vector4(q.x,q.y,q.z,q.w)});
             }
             for(int i=0;i<plant.leafRod.Length;i++)
             {
@@ -421,12 +478,14 @@ namespace Foliage
             CompletePendingStep();
             contact?.Reset();
             selfContact.Clear();
+            ResetFigClusters();
+            if(stiffFigJoints.Count>0)figDual.SetData(new FigAxisState[stiffFigJoints.Count*3]);
             x.SetData(rest); velocity.SetData(new Vector3[Count]);
             Array.Copy(rest,positions,Count);
             Array.Clear(samples,0,Count); Array.Clear(residual,0,residual.Length);
             for(int v=0;v<Count;v++) samples[v].position=rest[v];
             ResolveObstacleSpawn();
-            badVertex=-1; Steps=0; grabFace=grabRod=-1; appliedGrab=default; elasticEnergy=default;
+            figPositionsStale=false;badVertex=-1; Steps=0; grabFace=grabRod=-1; appliedGrab=default; elasticEnergy=default;
         }
         public Vector3 Point(int face,Vector3 w)
         {
@@ -548,7 +607,7 @@ namespace Foliage
             CompletePendingStep();
             DispatchStep(dt,false,true);
         }
-        void DispatchStep(float dt,bool measureSweeps,bool deferReadback)
+        void DispatchStep(float dt,bool measureSweeps,bool deferReadback,bool figSummaryOnly=false)
         {
             bool collide=contact!=null && contact.shape!=ObstacleShape.Off;
             gpu.SetInt("PlayerOrbit",collide && contact.playerOrbit?1:0);
@@ -582,11 +641,36 @@ namespace Foliage
             gpu.SetInt("UseOgc",ogc?1:0);
             if(ogc)gpu.Dispatch(detect,contactBlocks,1,1);
             if(hasFragments)gpu.Dispatch(prepareFall,blocks,1,1);
+            bool trackClusters=figSummaryOnly && useFigClusters && figClusterRelax>=0 && !collide && !self;
+            if(trackClusters)UpdateFigClusters();
+            bool selective=trackClusters && !fullFigSweeps;
+            FigSelectiveStep=selective;
+            int dualBlocks=(stiffFigJoints.Count+63)/64;
+            if(dualBlocks>0){
+                bool grabbed=grabRod>=0 || grabFace>=0;
+                gpu.SetInt("FigLoadReleased",figWasGrabbed && !grabbed && !collide && !self && gravityScale==0?1:0);
+                figWasGrabbed=grabbed;
+                gpu.SetInt("FigBeginStep",1);
+                gpu.Dispatch(figDualKernel,dualBlocks,1,1);
+                gpu.SetInt("FigBeginStep",0);
+            }
+            bool coarseRecovery=figClusterRelax>=0 && !collide && !self && gravityScale==0 && grabFace<0 && grabRod<0;
+            if(figClusterRelax>=0){
+                float guess=.7f;
+                // Suppress extrapolation as the worst node approaches the 1 mm
+                // sleep envelope. The inertial target still uses the full velocity.
+                if(figSummaryOnly && coarseRecovery)
+                    guess=Mathf.Lerp(.15f,.7f,Mathf.InverseLerp(.001f,.012f,FigMaxRestError));
+                gpu.SetFloat("VelocityGuess",guess);
+            }
             gpu.Dispatch(predict,blocks,1,1);
             if(structuralCount>0) gpu.Dispatch(cacheRestMotion,(structuralCount+63)/64,1,1);
             if(self)gpu.Dispatch(snapshot,blocks,1,1);
             if(collide)gpu.Dispatch(detect,contactBlocks,1,1);
-            for(int i=0;i<iterations;i++)
+            // Unloaded boughs also get an energy-tested whole-bough correction below.
+            // Reserve the full local iteration budget for loaded or contacting geometry.
+            if(trackClusters)RunFigSweeps(selective,dualBlocks,coarseRecovery?Math.Min(3,iterations):iterations);
+            else for(int i=0;i<iterations;i++)
             {
                 if(localPlants>0)gpu.Dispatch(localRelax,localPlants,1,1);
                 else for(int group=0;group<colorCount;group++)
@@ -595,14 +679,36 @@ namespace Foliage
                     gpu.SetInt("GroupStart",start);
                     gpu.Dispatch(relax,(groupOffsets[group+1]-start)/64,1,1);
                 }
+                if(dualBlocks>0)gpu.Dispatch(figDualKernel,dualBlocks,1,1);
                 if(collide)gpu.Dispatch(detect,contactBlocks,1,1);
                 if(self)gpu.Dispatch(snapshot,blocks,1,1);
-                if(measureSweeps || i==iterations-1)
+                if(!figSummaryOnly && (measureSweeps || i==iterations-1) && !(coarseRecovery && i==iterations-1))
                 {
                     gpu.SetInt("Sweep",i); gpu.Dispatch(measure,blocks,1,1);
                 }
             }
-            gpu.Dispatch(finish,blocks,1,1);
+            if(selective)gpu.Dispatch(figFollow,blocks,1,1);
+            if(coarseRecovery){
+                gpu.Dispatch(figTrialEnergy,figTrialGroups,1,1);
+                gpu.Dispatch(figChooseTrial,1,1,1);
+                gpu.Dispatch(figApplyTrial,blocks,1,1);
+                if(!figSummaryOnly){
+                    gpu.SetInt("Sweep",iterations-1);
+                    gpu.Dispatch(measure,blocks,1,1);
+                }
+            }
+            if(!figSummaryOnly)gpu.Dispatch(finish,blocks,1,1);
+            if(figSummaryOnly)
+            {
+                gpu.Dispatch(figParticles,figGroupCount,1,1);
+                gpu.Dispatch(figBough,1,1,1);
+                if(deferReadback){
+                    pendingReadback=AsyncGPUReadback.Request(figResult);
+                    pendingFig=true;
+                    Pending=true;
+                }else ReadFigSummary(false);
+                return;
+            }
             if(deferReadback)
             {
                 // The next tick needs positions for its CPU contact search. Enqueue the
@@ -640,10 +746,49 @@ namespace Foliage
                 residual[i]=max;
             }
         }
+        bool pendingFig;
+        internal float FigMaxRestError {get;private set;}
+        internal float FigMaxTravel {get;private set;}
+        struct FigSummary { public Vector3 lo; public float maxTravelSq; public Vector3 hi; public int invalid,awakeTwigNodes; public float maxRestErrorSq; }
+        int figParticles,figBough,figGroupCount;
+        ComputeBuffer figResult;
+        readonly FigSummary[] figFallback=new FigSummary[1];
+        bool figPositionsStale;
+        internal void QueueFigStep()
+        {
+            DispatchStep(1f/60,false,SystemInfo.supportsAsyncGPUReadback,true);
+        }
+
+        void ReadFigSummary(bool async)
+        {
+            FigSummary summary;
+            if(async && !pendingReadback.hasError)summary=pendingReadback.GetData<FigSummary>()[0];
+            else {figResult.GetData(figFallback);summary=figFallback[0];}
+            // Choose the next sweep from the completed tick. Separate thresholds avoid mode chatter.
+            if(useFigClusters && figTwigNodes>0)
+                fullFigSweeps=summary.awakeTwigNodes >= figTwigNodes*(fullFigSweeps?.70f:.85f);
+            badVertex=summary.invalid;
+            FigMaxRestError=Mathf.Sqrt(summary.maxRestErrorSq);
+            FigMaxTravel=Mathf.Sqrt(summary.maxTravelSq);
+            particleBounds.SetMinMax(summary.lo,summary.hi);
+            figPositionsStale=true;
+            Steps++;
+        }
+
+        internal void RefreshFigPickPositions()
+        {
+            if(!figPositionsStale)return;
+            x.GetData(positions);
+            figPositionsStale=false;
+        }
+
         internal void CompletePendingStep()
         {
             if(!Pending)return;
             if(!pendingReadback.done)pendingReadback.WaitForCompletion();
+            if(pendingFig){
+                pendingFig=false;Pending=false;ReadFigSummary(true);return;
+            }
             bool mapped=!pendingReadback.hasError;
             if(!mapped)sampleBuffer.GetData(samples);
             if(pendingHits!=null && pendingHits==contact.hits && contact.shape!=ObstacleShape.Off && !contact.needsPlacement)
@@ -852,6 +997,43 @@ namespace Foliage
             mesh.subMeshCount=1;
             mesh.SetSubMesh(0,new SubMeshDescriptor(0,indices.Length){bounds=bounds,vertexCount=skinCount},CutMeshFlags);
             mesh.bounds=bounds;particleBounds=bounds;
+            BindSkinBuffers(mesh,previous);
+        }
+
+        internal void BindFigMesh(Mesh mesh)
+        {
+            figParticles=gpu.FindKernel("FigParticleSummary");
+            figBough=gpu.FindKernel(figStates==null?"FigBoughSummary":"FigClusterBoughSummary");
+            if(figStates!=null){
+                gpu.SetBuffer(figBough,"FigState",figStates);
+                gpu.SetBuffer(figBough,"FigRange",figRanges);
+                gpu.SetInt("FigClusterCount",initialFigStates.Length-1);
+            }
+            figGroupCount=(Count+127)/128;
+            var groups=new ComputeBuffer(figGroupCount,40);
+            buffers.Add(groups);
+            figResult=new ComputeBuffer(1,40);
+            buffers.Add(figResult);
+            gpu.SetBuffer(figParticles,"X",x);gpu.SetBuffer(figParticles,"Old",oldPositions);
+            if(figRest==null){
+                figRest=new ComputeBuffer(Count,12);
+                buffers.Add(figRest);
+                figRest.SetData(rest);
+            }
+            gpu.SetBuffer(figParticles,"FigRest",figRest);
+            gpu.SetBuffer(figParticles,"Velocity",velocity);
+            gpu.SetBuffer(figParticles,"FigSummaryOut",groups);
+            gpu.SetInt("FigGroupCount",figGroupCount);
+            gpu.SetBuffer(figBough,"FigSummaryIn",groups);gpu.SetBuffer(figBough,"FigSummaryOut",figResult);
+            skinKernel=gpu.FindKernel("DeformSkin");normalKernel=gpu.FindKernel("SkinNormals");
+            PrepareRenderData(mesh.normals);
+            mesh.vertexBufferTarget|=GraphicsBuffer.Target.Raw;
+            particleBounds=mesh.bounds;
+            BindSkinBuffers(mesh,null);
+        }
+
+        void BindSkinBuffers(Mesh mesh,VbdSheet previous)
+        {
             skinVertices=mesh.GetVertexBuffer(0);
             gpu.SetBuffer(skinKernel,"SkinVertices",skinVertices);
             gpu.SetBuffer(normalKernel,"SkinVertices",skinVertices);
@@ -908,11 +1090,13 @@ namespace Foliage
             CompletePendingStep();
             if(mappedPositions.IsCreated)mappedPositions.Dispose();
             if(summaries.IsCreated)summaries.Dispose();
+            figSparseSweeps?.Release();figDenseSweeps?.Release();
             skinVertices?.Dispose();
             selfContact?.Dispose();
             foreach(var buffer in buffers) buffer.Release();
             buffers.Clear();
-            UnityEngine.Object.Destroy(gpu);
+            if(Application.isPlaying)UnityEngine.Object.Destroy(gpu);
+            else UnityEngine.Object.DestroyImmediate(gpu);
         }
     }
 }

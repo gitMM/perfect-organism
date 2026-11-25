@@ -24,7 +24,7 @@ public static class FoliageScene
         var camera=new GameObject("Lab camera").AddComponent<Camera>();
         camera.tag="MainCamera";
         camera.clearFlags=CameraClearFlags.SolidColor;
-        camera.backgroundColor=new Color(.095f,.125f,.13f);
+        SetLabLighting(camera);
         camera.nearClipPlane=.025f;
         camera.fieldOfView=37;
         camera.transform.position=new Vector3(0,1.15f,-4.4f);
@@ -36,6 +36,21 @@ public static class FoliageScene
         sphere.SetActive(false);
         lab.testSphere=sphere.transform;
         if(!EditorSceneManager.SaveScene(scene,Path)) throw new Exception("Could not save foliage scene");
+    }
+
+    internal static void SetLabLighting(Camera camera)
+    {
+        camera.backgroundColor=new Color(.32f,.38f,.40f);
+        RenderSettings.ambientMode=UnityEngine.Rendering.AmbientMode.Trilight;
+        RenderSettings.ambientSkyColor=new Color(.80f,.86f,.92f);
+        RenderSettings.ambientEquatorColor=new Color(.56f,.60f,.56f);
+        RenderSettings.ambientGroundColor=new Color(.38f,.35f,.30f);
+        var sun=new GameObject("Lab daylight").AddComponent<Light>();
+        sun.type=LightType.Directional;
+        sun.color=new Color(1f,.96f,.87f);
+        sun.intensity=1.45f;
+        sun.transform.rotation=Quaternion.Euler(42f,-32f,0);
+        RenderSettings.sun=sun;
     }
 
     [MenuItem("Tools/Foliage/Benchmark ten plants")]

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -29,6 +29,54 @@ namespace Foliage
     {
         public PlantSettings settings = PlantSettings.Default;
         public Camera view;
+        public InteractiveJungleFig jungleFigPrefab;
+        InteractiveJungleFig jungleFig;
+        bool restoreSphere;
+        Vector3 previousPivot;
+        float previousDistance;
+
+        public void OpenJungleFig()
+        {
+            if(jungleFig || !jungleFigPrefab)return;
+            FinishQueuedTick();
+            EndDrag();
+            CancelCut();
+            previousPivot=pivot; previousDistance=distance;
+            restoreSphere=testSphere.gameObject.activeSelf;
+            testSphere.gameObject.SetActive(false);
+            if(obstacleObject)obstacleObject.SetActive(false);
+            GetComponent<MeshRenderer>().enabled=false;
+            jungleFig=Instantiate(jungleFigPrefab,transform.position,Quaternion.identity);
+            jungleFig.interactionCamera=view;
+            jungleFig.labClock=true;
+            FrameFig();
+        }
+
+        void FrameFig()
+        {
+            var renderers=jungleFig.GetComponentsInChildren<MeshRenderer>();
+            var bounds=renderers[0].bounds;
+            foreach(var r in renderers)bounds.Encapsulate(r.bounds);
+            pivot=bounds.center;
+            PlaceCamera();
+            float halfAngle=view.fieldOfView*.5f*Mathf.Deg2Rad;
+            halfAngle=Mathf.Min(halfAngle,Mathf.Atan(Mathf.Tan(halfAngle)*view.aspect));
+            distance=1.03f*bounds.extents.magnitude/Mathf.Sin(halfAngle);
+            PlaceCamera();
+        }
+
+        public void CloseJungleFig()
+        {
+            if(!jungleFig)return;
+            jungleFig.gameObject.SetActive(false);
+            Destroy(jungleFig.gameObject);
+            jungleFig=null;
+            GetComponent<MeshRenderer>().enabled=true;
+            testSphere.gameObject.SetActive(restoreSphere);
+            if(obstacleObject)obstacleObject.SetActive(true);
+            pivot=previousPivot;distance=previousDistance;PlaceCamera();
+            lastClockTime=Time.realtimeSinceStartupAsDouble;
+        }
         public Transform testSphere;
         public PlantGeometry Geometry { get; private set; }
         public int Tick { get; private set; }
@@ -142,7 +190,7 @@ namespace Foliage
             float panelWidth=PanelWidth*UiScale;
             view.rect=new Rect(panelWidth/Screen.width,0,1-panelWidth/Screen.width,1);
         }
-        internal static bool Intersect(Ray ray,Vector3 a,Vector3 b,Vector3 c,out float t,out Vector3 weights)
+        public static bool Intersect(Ray ray,Vector3 a,Vector3 b,Vector3 c,out float t,out Vector3 weights)
         {
             Vector3 ab=b-a, ac=c-a, h=Vector3.Cross(ray.direction,ac);
             float det=Vector3.Dot(ab,h);
@@ -196,9 +244,9 @@ namespace Foliage
                 SimulationStep==null && SystemInfo.supportsAsyncGPUReadback;
             // Render/input can run while the GPU works. Synchronize when the next
             // fixed tick actually needs positions, or a caller requests a step.
-            if(!canQueue || paused || cutting || Sheet.ReadbackReady || accumulator+elapsed*speed>=step)
+            if(!jungleFig && (!canQueue || paused || cutting || Sheet.ReadbackReady || accumulator+elapsed*speed>=step))
                 FinishQueuedTick();
-            if(!paused && !cutting)
+            if(!jungleFig && !paused && !cutting)
             {
                 // The queued solver can repay a brief stall over later renders.
                 // Keep elapsed time measured after fixture creation, including the first frame.
@@ -230,8 +278,9 @@ namespace Foliage
                 (Input.GetKey(KeyCode.E)?1:0)-(Input.GetKey(KeyCode.Q)?1:0),
                 (Input.GetKey(KeyCode.W)?1:0)-(Input.GetKey(KeyCode.S)?1:0));
             pivot+=view.transform.rotation*travel.normalized*(Time.unscaledDeltaTime*distance*.6f);
-            if(!grabbing && !movingSphere) distance=Mathf.Clamp(distance*Mathf.Exp(-scroll*.12f),.15f,25);
+            if(!grabbing && !movingSphere) distance=Mathf.Clamp(distance*Mathf.Exp(-scroll*.12f),.15f,jungleFig?view.farClipPlane*.8f:25);
             PlaceCamera();
+            if(jungleFig)return;
             var ray=view.ScreenPointToRay(mouse);
             if(Sheet!=null)
             {

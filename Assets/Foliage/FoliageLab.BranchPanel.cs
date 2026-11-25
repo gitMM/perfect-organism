@@ -18,7 +18,7 @@ namespace Foliage
         Label obstacleStats;
         VisualElement contactModels;
         float nextPanelUpdate;
-        bool CompactBranchPanel=>Sheet?.plant!=null && settings.forked &&
+        bool CompactBranchPanel=>!jungleFig && Sheet?.plant!=null && settings.forked &&
             sheetTab==0 && !expandBranchSettings;
 
         static void Highlight(Button button,bool selected)
@@ -126,6 +126,7 @@ namespace Foliage
             Control(modes,"Sheet",()=>SetSheetMode(true));
             Control(modes,"Leaf",()=>OpenLeaf(leafIndex));
             Control(modes,"Stems",()=>{},true);
+            if(jungleFigPrefab)Control(Row(),"Jungle fig",OpenJungleFig);
             debugButton=Control(Row(),"Debug rendering",()=>SetDebugRendering(!debugRendering),debugRendering);
             Control(Row(),TenCapsuleTest,()=>OpenCapsulePreset(10));
             hundredPreset=Control(Row(),HundredCapsuleTest,()=>OpenCapsulePreset(100));

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -126,6 +126,9 @@ namespace Foliage
                     if(i>=previous.geometry.surface.Count && g.surface[i].face>=0)shells.Add(i);
                 }
             }
+            for(int i=0;i<g.fixedCollarVertices;i++){
+                skinRod[i]=0;skinNode[i]=g.rods[0].b;
+            }
             for(int i=retained;i<skin.Length;i++)
                 if(skinRod[i]>=0)skinOffset[i]=Quaternion.Inverse(restFrames[skinRod[i]])*(g.skin[i]-rest[skinNode[i]]);
             int batches=(g.surface.Count+PickBatch-1)/PickBatch;
@@ -170,7 +173,7 @@ namespace Foliage
                 if(r>=0) skin[i]+=frames[r]*skinOffset[i];
             }
         }
-        internal int PickSurface(Ray ray,Vector3[] positions,ref float nearest,out Vector3 weights)
+        public int PickSurface(Ray ray,Vector3[] positions,ref float nearest,out Vector3 weights)
         {
             for(int i=0;i<frames.Length;i++)frames[i]=Frame(positions,i);
             Vector3 Vertex(int v)
