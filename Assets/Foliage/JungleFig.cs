@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -104,17 +104,25 @@ namespace Foliage
 
         // With shoot output supplied, each flexible subtree is emitted once, separately from fixed wood.
         public static Mesh Generate(int seed, FigSettings settings,List<FigShoot> shoots)
-            => FigFileCache.LoadOrGenerate(seed, settings, shoots);
+            => Generate(seed,settings,shoots,null);
 
-        internal static Mesh GenerateFresh(int seed, FigSettings settings,List<FigShoot> shoots)
+        internal static Mesh Generate(int seed, FigSettings settings,List<FigShoot> shoots,Action<int,FigShoot> prepare)
         {
             var fig=new JungleFig(seed,settings){shoots=shoots};
             int firstShoot=shoots?.Count??0;
             fig.BuildCrown();
             fig.triangles.RemoveAll(index=>index<0);
-            if(shoots!=null)
-                for(int i=firstShoot;i<shoots.Count;i++)shoots[i].geometry.surface.RemoveAll(face=>face.rod==-2);
-            fig.BuildBase();
+            if(shoots==null)fig.BuildBase();
+            else {
+                // The trunk and each bough own disjoint geometry and random streams.
+                System.Threading.Tasks.Parallel.For(firstShoot,shoots.Count+1,i=>{
+                    if(i==shoots.Count){fig.BuildBase();return;}
+                    var shoot=shoots[i];
+                    shoot.FinishCrown();
+                    shoot.geometry.surface.RemoveAll(face=>face.rod==-2);
+                    prepare?.Invoke(i,shoot);
+                });
+            }
             var mesh=new Mesh {name="Jungle fig "+seed, indexFormat=IndexFormat.UInt32};
             for(int i=0;i<fig.vertices.Count;i++) fig.vertices[i]*=settings.size;
             mesh.SetVertices(fig.vertices);
@@ -434,7 +442,7 @@ namespace Foliage
                 }
             }
             if(depth==0){
-                shoot?.GrowLeafSprays(path,depth,length*settings.size);
+                shoot?.PlanFoliage(path,depth,length*settings.size);
                 return;
             }
             var side=Vector3.Cross(endDir,Vector3.up).normalized;
@@ -464,8 +472,7 @@ namespace Foliage
                 if(ringMesh)outlet=i==0?TipSocket(section):SideSocket(section,next);
                 Branch(child,next,length*Range(.56f,.79f),radius*(i==0?.68f:.47f),depth-1,false,shoot,node,outlet);
             }
-            if(depth<=2)shoot?.GrowLeafSprays(path,depth,length*settings.size);
-            if(depth>=2 && depth<=4)shoot?.GrowCrownLaterals(path,length*settings.size);
+            if(depth<=4)shoot?.PlanFoliage(path,depth,length*settings.size);
             // Fork shaping has now set the final rod positions. Attach roots to
             // their nearest actual bough node, after all junction edits.
             if(aerial!=null)foreach(var root in aerial){

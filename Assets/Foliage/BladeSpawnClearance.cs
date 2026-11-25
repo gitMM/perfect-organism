@@ -5,6 +5,7 @@ namespace Foliage
 {
     // Swept triangle SAT along world Y. Each pair forbids an interval of stalk-tip
     // heights. Leaving their union clears both collision skins and the contact envelope.
+    [Unity.Burst.BurstCompile]
     sealed class BladeSpawnClearance
     {
         const float clearance=.0061f;
@@ -33,6 +34,7 @@ namespace Foliage
             lo=Mathf.Max(lo,Mathf.Min(t0,t1));hi=Mathf.Min(hi,Mathf.Max(t0,t1));
             return lo<=hi;
         }
+        [Unity.Burst.BurstCompile]
         static bool Interval(in Triangle m,in Triangle f,out Vector2 interval)
         {
             interval=default;

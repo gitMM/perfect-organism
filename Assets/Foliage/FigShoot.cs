@@ -8,7 +8,7 @@ namespace Foliage
     {
         public readonly PlantGeometry geometry=new();
         public readonly Vector3 origin;
-        readonly BladeSpawnClearance clearance=new(.12f);
+        BladeSpawnClearance clearance=new(.12f);
         readonly HashSet<int> aerialRods=new();
         readonly System.Random buds;
         readonly int density;
@@ -37,79 +37,18 @@ namespace Foliage
             for(int i=first;i<geometry.rods.Count;i++)aerialRods.Add(i);
             if(grounded)geometry.groundPins.Add(path[segments]);
         }
-        internal void WriteCache(System.IO.BinaryWriter w)
-        {
-            w.Write(origin.x);
-            w.Write(origin.y);
-            w.Write(origin.z);
-            w.Write(LeafyTwigCount);
-            w.Write(geometry.fixedCollarVertices);
-            w.Write(geometry.distributedStemSupport);
-            FigFileCache.Write(w, geometry.nodes.ToArray());
-            FigFileCache.Write(w, geometry.rods.ToArray());
-            FigFileCache.Write(w, geometry.faces.ToArray());
-            FigFileCache.Write(w, geometry.twigClusters.ToArray());
-            FigFileCache.Write(w, geometry.rootNodes.ToArray());
-            FigFileCache.Write(w, geometry.groundPins.ToArray());
-            FigFileCache.Write(w, geometry.joints.ToArray());
-            FigFileCache.Write(w, geometry.thicknessRatio.ToArray());
-            FigFileCache.Write(w, geometry.skin.ToArray());
-            FigFileCache.Write(w, geometry.colors.ToArray());
-            FigFileCache.Write(w, geometry.bladeUV.ToArray());
-            FigFileCache.Write(w, geometry.surface.ToArray());
-            FigFileCache.Write(w, neighboringLeaf.ToArray());
-            var aerial = new int[aerialRods.Count];
-            aerialRods.CopyTo(aerial);
-            FigFileCache.Write(w, aerial);
-            FigFileCache.Write(w, boundarySource);
-            FigFileCache.Write(w, boundaryGrain);
-            FigFileCache.Write(w, boundaryNormals);
-            FigFileCache.Write(w, boundaryDirection);
-            FigFileCache.Write(w, boundaryAge);
-            w.Write(geometry.bladeRows.Count);
-            foreach (var blade in geometry.bladeRows)
-            {
-                w.Write(blade.Count);
-                foreach (var row in blade) FigFileCache.Write(w, row);
-            }
-        }
-
-        internal FigShoot(System.IO.BinaryReader r)
-        {
-            origin = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
-            LeafyTwigCount = r.ReadInt32();
-            geometry.fixedCollarVertices = r.ReadInt32();
-            geometry.distributedStemSupport = r.ReadBoolean();
-            geometry.nodes.AddRange(FigFileCache.Read<Vector3>(r));
-            geometry.rods.AddRange(FigFileCache.Read<PlantGeometry.Rod>(r));
-            geometry.faces.AddRange(FigFileCache.Read<PlantGeometry.Face>(r));
-            geometry.twigClusters.AddRange(FigFileCache.Read<PlantGeometry.TwigCluster>(r));
-            geometry.rootNodes.AddRange(FigFileCache.Read<int>(r));
-            geometry.groundPins.AddRange(FigFileCache.Read<int>(r));
-            geometry.joints.AddRange(FigFileCache.Read<int>(r));
-            geometry.thicknessRatio.AddRange(FigFileCache.Read<float>(r));
-            geometry.skin.AddRange(FigFileCache.Read<Vector3>(r));
-            geometry.colors.AddRange(FigFileCache.Read<Color>(r));
-            geometry.bladeUV.AddRange(FigFileCache.Read<Vector2>(r));
-            geometry.surface.AddRange(FigFileCache.Read<PlantGeometry.SkinFace>(r));
-            neighboringLeaf.AddRange(FigFileCache.Read<int>(r));
-            aerialRods.UnionWith(FigFileCache.Read<int>(r));
-            boundarySource = FigFileCache.Read<int>(r);
-            boundaryGrain = FigFileCache.Read<Vector3>(r);
-            boundaryNormals = FigFileCache.Read<Vector3>(r);
-            boundaryDirection = FigFileCache.Read<Vector4>(r);
-            boundaryAge = FigFileCache.Read<float>(r);
-            int blades = FigFileCache.Count(r);
-            for (int i = 0; i < blades; i++)
-            {
-                int rows = FigFileCache.Count(r);
-                var blade = new List<int[]>(rows);
-                for (int j = 0; j < rows; j++) blade.Add(FigFileCache.Read<int>(r));
-                geometry.bladeRows.Add(blade);
-            }
-        }
-
         public IReadOnlyList<int> GroundPins=>geometry.groundPins;
+
+        readonly List<(int[] path,int depth,float length)> foliage=new();
+        internal void PlanFoliage(int[] path,int depth,float length)=>foliage.Add((path,depth,length));
+        internal void FinishCrown(){
+            foreach(var growth in foliage){
+                if(growth.depth<=2)GrowLeafSprays(growth.path,growth.depth,growth.length);
+                if(growth.depth>=2)GrowCrownLaterals(growth.path,growth.length);
+            }
+            foliage.Clear();
+            clearance=null;
+        }
 
         internal int[] AddTwig(Vector3 start,Vector3 mid,Vector3 end,float radius,float tip,int joint)
         {
@@ -267,55 +206,144 @@ namespace Foliage
             for(int i=0;i<12;i++)normalBuffer[i]=boundaryNormals[i];
             mesh.SetNormals(normalBuffer);
         }
-        public Mesh CreateMesh(){
-            var mesh=new Mesh{name="Fig twig and leaves",indexFormat=UnityEngine.Rendering.IndexFormat.UInt32};
-            mesh.SetVertices(geometry.skin);mesh.SetColors(geometry.colors);mesh.SetUVs(0,geometry.bladeUV);
-            var wood=new List<int>();
-            var foliage=new List<int>();
-            var uv=new Vector3[geometry.skin.Count];
-            var directions=new Vector4[uv.Length];
-            var age=new Vector4[uv.Length];
-            for(int i=0;i<uv.Length;i++)uv[i]=geometry.bladeUV[i];
-            foreach(var f in geometry.surface){
-                bool woody=f.rod>=0 && geometry.rods[f.rod].part==0;
-                var indices=woody?wood:foliage;
-                indices.Add(f.a);indices.Add(f.b);indices.Add(f.c);
-                if(!woody)continue;
-                var rod=geometry.rods[f.rod];
-                Vector3 axis=(geometry.nodes[rod.b]-geometry.nodes[rod.a]).normalized;
-                void Bind(int v){
-                    var local=geometry.skin[v];
-                    uv[v]=Vector3.ProjectOnPlane(local-geometry.nodes[rod.a],axis);
-                    directions[v]=new Vector4(axis.x,axis.y,axis.z,0);
-                    Vector3 rest=local+origin;
-                    age[v]=new Vector4(rest.x,rest.y,rest.z,aerialRods.Contains(f.rod)?4:2+YoungWood(rod.radius));
+        internal sealed class MeshData
+        {
+            internal readonly int[] wood,leaves;
+            internal readonly Vector3[] grain;
+            internal readonly Vector4[] direction,age;
+
+            internal MeshData(FigShoot shoot){
+                var g=shoot.geometry;
+                int woodyFaces=0;
+                bool Woody(PlantGeometry.SkinFace f)=>f.rod>=0 && g.rods[f.rod].part==0;
+                foreach(var f in g.surface)if(Woody(f))woodyFaces++;
+                wood=new int[3*woodyFaces];
+                leaves=new int[3*(g.surface.Count-woodyFaces)];
+                var owner=new int[g.skin.Count];
+                int w=0,l=0;
+                foreach(var f in g.surface){
+                    if(Woody(f)){
+                        wood[w++]=f.a;wood[w++]=f.b;wood[w++]=f.c;
+                        owner[f.a]=owner[f.b]=owner[f.c]=f.rod+1;
+                    }else{
+                        leaves[l++]=f.a;leaves[l++]=f.b;leaves[l++]=f.c;
+                    }
                 }
-                Bind(f.a);Bind(f.b);Bind(f.c);
+                grain=new Vector3[owner.Length];
+                direction=new Vector4[owner.Length];
+                age=new Vector4[owner.Length];
+                var axes=new Vector3[g.rods.Count];
+                var maturity=new float[g.rods.Count];
+                for(int i=0;i<g.rods.Count;i++){
+                    var rod=g.rods[i];
+                    if(rod.part!=0)continue;
+                    axes[i]=(g.nodes[rod.b]-g.nodes[rod.a]).normalized;
+                    maturity[i]=shoot.aerialRods.Contains(i)?4:2+YoungWood(rod.radius);
+                }
+                for(int v=0;v<owner.Length;v++){
+                    int id=owner[v]-1;
+                    if(id<0){grain[v]=g.bladeUV[v];continue;}
+                    var p=g.skin[v];
+                    var rest=p+shoot.origin;
+                    grain[v]=Vector3.ProjectOnPlane(p-g.nodes[g.rods[id].a],axes[id]);
+                    direction[v]=axes[id];
+                    age[v]=new Vector4(rest.x,rest.y,rest.z,maturity[id]);
+                }
+                for(int i=0;i<12;i++){
+                    grain[i]=shoot.boundaryGrain[i];direction[i]=shoot.boundaryDirection[i];
+                    Vector3 p=g.skin[i]+shoot.origin;
+                    age[i]=new Vector4(p.x,p.y,p.z,2+shoot.boundaryAge[i]);
+                }
             }
-            for(int i=0;i<12;i++){
-                uv[i]=boundaryGrain[i];directions[i]=boundaryDirection[i];
-                Vector3 p=geometry.skin[i]+origin;
-                age[i]=new Vector4(p.x,p.y,p.z,2+boundaryAge[i]);
-            }
-            mesh.SetUVs(0,uv);mesh.SetUVs(1,directions);mesh.SetUVs(2,age);
+        }
+
+        public Mesh CreateMesh()=>CreateMesh(new MeshData(this));
+        internal Mesh CreateMesh(MeshData data){
+            var mesh=new Mesh{name="Fig twig and leaves",indexFormat=UnityEngine.Rendering.IndexFormat.UInt32};
+            mesh.SetVertices(geometry.skin);mesh.SetColors(geometry.colors);
+            mesh.SetUVs(0,data.grain);mesh.SetUVs(1,data.direction);mesh.SetUVs(2,data.age);
             mesh.subMeshCount=2;
-            mesh.SetTriangles(wood,0);mesh.SetTriangles(foliage,1);UpdateNormals(mesh);
+            mesh.SetTriangles(data.wood,0,false);mesh.SetTriangles(data.leaves,1,true);
+            UpdateNormals(mesh);
             return mesh;
         }
+
+#if UNITY_EDITOR
+        [UnityEditor.MenuItem("Tools/Foliage/Check twig rebound against a sphere")]
+        static void CheckTwigContactRebound()
+        {
+            var shoot=new FigShoot(Vector3.zero,Vector3.right*.15f,.15f,new FigSettings{size=1},2);
+            var scaffold=shoot.AddTwig(Vector3.zero,Vector3.right*.3f,Vector3.right*.6f,.12f,.07f,1);
+            int socket=scaffold[scaffold.Length-1];
+            var cluster=shoot.StartCluster(socket);
+            int[] twig=shoot.LeafyTwig(socket,Vector3.right,.8f,-.12f,7);
+            shoot.EndCluster(cluster);
+            int tip=twig[6];
+            foreach(var model in new[]{ContactModel.Penalty,ContactModel.OGC}){
+                using var solver=new VbdSheet(plant:new RodPlant(shoot.geometry)){gravityScale=0};
+                solver.selfContact.enabled=false;
+                var obstacle=solver.contact;
+                Vector3 rest=solver.rest[tip],home=rest-Vector3.up*.32f;
+                obstacle.model=model;
+                obstacle.Configure(ObstacleShape.Sphere,home,Quaternion.identity,.075f);
+                int rodContacts=0;
+                float peak=0,peakPenetration=0;
+                float Step(){
+                    solver.Step(1f/60,false);
+                    if(solver.badVertex>=0)throw new InvalidOperationException($"Invalid twig node {solver.badVertex}");
+                    float error=Vector3.Distance(solver.positions[tip],rest);
+                    peak=Mathf.Max(peak,error);
+                    peakPenetration=Mathf.Max(peakPenetration,obstacle.physicalPenetration);
+                    rodContacts=Mathf.Max(rodContacts,obstacle.rods);
+                    return error;
+                }
+                for(int i=0;i<70;i++){
+                    if(i==2)obstacle.target=rest+Vector3.up*.1f;
+                    Step();
+                }
+                // Leave the sphere in the solver as it retreats; the ordinary contact
+                // and recovery passes must run together throughout this test.
+                obstacle.target=home;
+                int lastContact=0,lastOutside=0;
+                for(int i=1;i<=120;i++){
+                    if(Step()>.001f)lastOutside=i;
+                    if(obstacle.rods+obstacle.faces>0)lastContact=i;
+                }
+                if(rodContacts==0 || peak<.02f || lastContact>=120 || lastOutside>90 ||
+                   (model==ContactModel.OGC && peakPenetration>.001f))
+                    throw new InvalidOperationException($"{model}: {rodContacts} rod contacts, {peak:F3} m deflection, last contact {lastContact}, last outside 1 mm {lastOutside}, {peakPenetration:F4} m penetration.");
+                Debug.Log($"{model}: twig deflected {peak*1000:F0} mm and stayed within 1 mm from withdrawal tick {lastOutside+1}. Peak penetration {peakPenetration*1000:F2} mm.");
+            }
+        }
+#endif
     }
     public sealed class FigBranchInstance
         {
+            const float MouseGrabForceScale=10f;
             public FigShoot shoot;
             public Mesh mesh;
             public RodPlant rig;
             public VbdSheet solver;
             public Vector3 Center=>shoot.origin+mesh.bounds.center;
             public FigBranchInstance(FigShoot shoot){this.shoot=shoot;mesh=shoot.CreateMesh();}
+            internal FigBranchInstance(FigShoot shoot,FigShoot.MeshData data){this.shoot=shoot;mesh=shoot.CreateMesh(data);}
             public void Activate(){
                 if(solver!=null)return;
                 rig??=new RodPlant(shoot.geometry);
                 // The generated crown describes the settled, unloaded configuration.
-                solver=new VbdSheet(plant:rig){gravityScale=0,grabK=22,grabLimit=2.5f};
+                solver=new VbdSheet(plant:rig);
+                ConfigureSolver();
+            }
+            internal void Activate(VbdSheet prepared){
+                rig=prepared.plant;
+                solver=prepared;
+                solver.UploadTopology();
+                solver.Reset();
+                ConfigureSolver();
+            }
+            void ConfigureSolver(){
+                solver.gravityScale=0;solver.grabK=22;solver.grabLimit=2.5f;
+                solver.grabD*=MouseGrabForceScale;
                 solver.selfContact.enabled=false;
             }
             public const string DebugLegend="VBD: blue sleeping / cyan awake\nAVBD joint: purple sleeping / orange awake\nNatural bark: static wood";
@@ -404,7 +432,8 @@ namespace Foliage
                 }else{
                     solver.weights=weights;solver.target=solver.Point(surface.face,weights);
                 }
-                solver.grabK=stiffness;solver.grabLimit=1.5f*stiffness;
+                solver.grabK=MouseGrabForceScale*stiffness;
+                solver.grabLimit=1.5f*solver.grabK;
                 return solver.target;
             }
             public void Sleep(){

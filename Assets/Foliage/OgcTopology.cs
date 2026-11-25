@@ -18,7 +18,7 @@ namespace Foliage
             int first=plant.rods.Count;
             regions=new Region[first+plant.faces.Count];
             var owner=new int[plant.nodes.Count]; Array.Fill(owner,-1);
-            var rings=new SortedSet<int>[owner.Length];
+            offsets=new int[owner.Length+1];
             var incidence=new Dictionary<Vector2Int,(int face,int side,int opposite)>();
             for(int i=0;i<plant.faces.Count;i++)
             {
@@ -29,8 +29,6 @@ namespace Foliage
                     int a=nodes[j],b=nodes[(j+1)%3],opposite=nodes[(j+2)%3];
                     if(owner[a]<0)owner[a]=id;
                     regions[id].vertexOwner[j]=owner[a];
-                    (rings[a]??=new SortedSet<int>()).Add(b);
-                    (rings[b]??=new SortedSet<int>()).Add(a);
                     var key=new Vector2Int(Math.Min(a,b),Math.Max(a,b));
                     if(incidence.TryGetValue(key,out var other))
                     {
@@ -41,17 +39,21 @@ namespace Foliage
                     else
                     {
                         incidence.Add(key,(id,j,opposite));
+                        offsets[a+1]++;
+                        offsets[b+1]++;
                         regions[id].edgeOwner[j]=id;regions[id].across[j]=-1;
                     }
                 }
             }
-            var flat=new List<int>();offsets=new int[owner.Length+1];
-            for(int i=0;i<owner.Length;i++)
-            {
-                offsets[i]=flat.Count;
-                if(rings[i]!=null)flat.AddRange(rings[i]);
+            for(int i=1;i<offsets.Length;i++)offsets[i]+=offsets[i-1];
+            neighbors=new int[offsets[owner.Length]];
+            var next=(int[])offsets.Clone();
+            foreach(var edge in incidence.Keys){
+                neighbors[next[edge.x]++]=edge.y;
+                neighbors[next[edge.y]++]=edge.x;
             }
-            offsets[owner.Length]=flat.Count;neighbors=flat.ToArray();
+            for(int i=0;i<owner.Length;i++)
+                Array.Sort(neighbors,offsets[i],offsets[i+1]-offsets[i]);
         }
     }
 }

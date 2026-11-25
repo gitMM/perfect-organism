@@ -39,7 +39,11 @@ namespace Foliage
 
         void OnEnable(){
             var shoots=new List<FigShoot>();
-            wood=JungleFig.Generate(seed,settings,shoots);
+            var prepared=new System.Collections.Concurrent.ConcurrentDictionary<int,(FigShoot.MeshData mesh,VbdSheet solver)>();
+            wood=JungleFig.Generate(seed,settings,shoots,(i,shoot)=>{
+                var rig=new RodPlant(shoot.geometry);
+                prepared[i]=(new FigShoot.MeshData(shoot),new VbdSheet(null,rig,true));
+            });
             generated=new GameObject("Fig wood");
             generated.transform.SetParent(transform,false);
             generated.AddComponent<MeshFilter>().sharedMesh=wood;
@@ -48,7 +52,9 @@ namespace Foliage
             leafMaterial=new Material(Resources.Load<Shader>("FigLeaf"));
             normalMaterials=new[]{bark,leafMaterial};
             foreach(var shoot in shoots){
-                var b=new FigBranchInstance(shoot);crown.Add(b);b.Activate();b.EnableRuntimeSkin();
+                prepared.TryRemove(crown.Count,out var data);
+                var b=new FigBranchInstance(shoot,data.mesh);crown.Add(b);
+                b.Activate(data.solver);b.EnableRuntimeSkin();
                 var go=new GameObject("Physical bough");
                 go.transform.SetParent(generated.transform,false);go.transform.localPosition=shoot.origin;
                 go.AddComponent<MeshFilter>().sharedMesh=b.mesh;

@@ -84,19 +84,14 @@ namespace Foliage
                 stretch=90; bend=.12f; dampingTime=.025f;
                 grabK=8; grabLimit=.6f; iterations=18;
             }
-            var elements=new List<Element>();
-            var faces=new List<int>();
+            var elements=new List<Element>(plant==null?0:plant.geometry.faces.Count*4+plant.parent.Length*6);
+            var faces=new List<int>(plant==null?0:plant.geometry.faces.Count*3);
             var firstOpposite=new Dictionary<Vector2Int,int>();
             var mass=new float[Count];
-            var incident=new List<int>[Count];
-            for(int v=0;v<Count;v++)
-            {
-                if(!shell) rest[v]=new Vector3((v%Side-5)*Spacing,(5-v/Side)*Spacing,0);
-                incident[v]=new List<int>();
-            }
+            if(!shell)for(int v=0;v<Count;v++)
+                rest[v]=new Vector3((v%Side-5)*Spacing,(5-v/Side)*Spacing,0);
             void Add(int a,int b,int c,int d,float length)
             {
-                int id=elements.Count;
                 float angle=0,vein=0;
                 if(c>=0 && shell)
                 {
@@ -111,8 +106,6 @@ namespace Foliage
                 // Membrane rigidity scales with thickness; flexural rigidity scales with its cube.
                 float scale=c<0?(Thickness(a)+Thickness(b))*.5f:Mathf.Pow((Thickness(c)+Thickness(d))*.5f,3);
                 elements.Add(new Element{a=a,b=b,c=c,d=d,extra=-1,rest=length,angle=angle,vein=vein,materialScale=scale});
-                incident[a].Add(id); incident[b].Add(id);
-                if(c>=0) {incident[c].Add(id); incident[d].Add(id);}
             }
             void Edge(int a,int b,int opposite)
             {
@@ -132,14 +125,12 @@ namespace Foliage
             if(plant!=null)
             {
                 foreach(var f in plant.geometry.faces) Face(f.a,f.b,f.c);
-                AddRods(plant,elements,incident,mass);
+                AddRods(plant,elements,mass);
                 if(stiffFigJoints.Count>0)iterations=8;
                 for(int i=0;i<contact.features.Length;i++)
                 {
-                    var f=contact.features[i]; int id=elements.Count;
+                    var f=contact.features[i];
                     elements.Add(new Element{a=f.a,b=f.b,c=f.c,d=-1,extra=-1,kind=4,rest=i});
-                    incident[f.a].Add(id);incident[f.b].Add(id);
-                    if(f.c>=0)incident[f.c].Add(id);
                 }
             }
             else if(leaf!=null)
@@ -152,6 +143,31 @@ namespace Foliage
                 }
             structuralCount=elements.Count-(contact?.features.Length??0);
             triangles=faces.ToArray();
+            // Build the GPU's packed incidence table directly. Centerline terms come
+            // first, with generation order preserved within each part of a node's row.
+            var offsets=new int[Count+1];
+            var rodCounts=new int[Count];
+            for(int i=0;i<elements.Count;i++){
+                var e=elements[i];
+                offsets[e.a+1]++;offsets[e.b+1]++;
+                if(e.c>=0)offsets[e.c+1]++;
+                if(e.d>=0)offsets[e.d+1]++;
+                if(e.extra>=0)offsets[e.extra+1]++;
+                if(e.kind==1 && e.materialScale>0){rodCounts[e.a]++;rodCounts[e.b]++;}
+            }
+            for(int v=0;v<Count;v++)offsets[v+1]+=offsets[v];
+            var centers=(int[])offsets.Clone();
+            var others=new int[Count];
+            for(int v=0;v<Count;v++)others[v]=offsets[v]+rodCounts[v];
+            var flat=new int[offsets[Count]];
+            for(int i=0;i<elements.Count;i++){
+                var e=elements[i];
+                var next=e.kind==1 && e.materialScale>0?centers:others;
+                flat[next[e.a]++]=i;flat[next[e.b]++]=i;
+                if(e.c>=0)flat[next[e.c]++]=i;
+                if(e.d>=0)flat[next[e.d]++]=i;
+                if(e.extra>=0)flat[next[e.extra]++]=i;
+            }
             // Each spring and each four-vertex hinge is a clique, including grab triangle edges.
             Array.Fill(colors,-1);
             var clamped=new HashSet<int>();
@@ -172,9 +188,9 @@ namespace Foliage
                 if(plant!=null ? clamped.Contains(v) :
                     leaf==null?v<Side:leaf.clamped[v]) continue;
                 int mark=v+1;
-                foreach(int i in incident[v])
+                for(int slot=offsets[v];slot<offsets[v+1];slot++)
                 {
-                    var e=elements[i];
+                    var e=elements[flat[slot]];
                     usedColors[colors[e.a]+1]=mark;usedColors[colors[e.b]+1]=mark;
                     if(e.c>=0) usedColors[colors[e.c]+1]=mark;
                     if(e.d>=0) usedColors[colors[e.d]+1]=mark;
@@ -186,7 +202,6 @@ namespace Foliage
             for(int i=0;i<Count;i++)if(colors[i]<0)pins.Add(i);
             // Pack each color into whole thread groups, in topology order for coherent reads.
             groupOffsets=new int[colorCount+1];
-            var groupNodes=new List<int>();
             // Adjacent lanes solve similar stencils; no dependencies exist within a color.
             int[] order=null;
             if(plant?.geometry.twigClusters.Count>0){
@@ -194,8 +209,8 @@ namespace Foliage
                 var keys=new long[Count];
                 for(int v=0;v<Count;v++){
                     int frames=0,shellTerms=0;
-                    foreach(int id in incident[v]){
-                        var kind=elements[id].kind;
+                    for(int slot=offsets[v];slot<offsets[v+1];slot++){
+                        var kind=elements[flat[slot]].kind;
                         if(kind==2 || kind==3)frames++;
                         if(kind==0)shellTerms++;
                     }
@@ -204,28 +219,17 @@ namespace Foliage
                 }
                 Array.Sort(keys,order);
             }
-            for(int group=0;group<colorCount;group++)
-            {
-                groupOffsets[group]=groupNodes.Count;
-                for(int i=0;i<Count;i++){
-                    int v=order==null?i:order[i];
-                    if(colors[v]==group)groupNodes.Add(v);
-                }
-                while(groupNodes.Count%64!=0)groupNodes.Add(-1);
-            }
-            groupOffsets[colorCount]=groupNodes.Count;
-            var offsets=new int[Count+1];
-            var flat=new List<int>();
-            var rodCounts=new int[Count];
-            bool Centerline(int id)=>elements[id].kind==1 && elements[id].materialScale>0;
             for(int v=0;v<Count;v++)
-            {
-                offsets[v]=flat.Count;
-                foreach(int id in incident[v])if(Centerline(id))flat.Add(id);
-                rodCounts[v]=flat.Count-offsets[v];
-                foreach(int id in incident[v])if(!Centerline(id))flat.Add(id);
+                if(colors[v]>=0)groupOffsets[colors[v]+1]++;
+            for(int group=0;group<colorCount;group++)
+                groupOffsets[group+1]=groupOffsets[group]+((groupOffsets[group+1]+63)/64)*64;
+            var groupNodes=new int[groupOffsets[colorCount]];
+            Array.Fill(groupNodes,-1);
+            var nextNode=(int[])groupOffsets.Clone();
+            for(int i=0;i<Count;i++){
+                int v=order==null?i:order[i];
+                if(colors[v]>=0)groupNodes[nextNode[colors[v]]++]=v;
             }
-            offsets[Count]=flat.Count;
 
             var localRanges=new List<PlantRange>();
             var localOrder=new List<int>();
@@ -339,7 +343,7 @@ namespace Foliage
                     Buffer("SelfPositions",Count,12,null,snapshot,relax,measure);
                     selfContact=new PlantSelfContact(contact,Count,gpu,predict,relax,measure,localPlants>0?localRelax:figClusterRelax,plant!=null && (plant.geometry.rootNodes.Count>=10 || plant.geometry.faces.Count>1000));
                     int featureCount=contact?.features.Length??0;
-                    Buffer("Features",Math.Max(1,featureCount),16,contact?.features,detect);
+                    var featureBuffer=Buffer("Features",Math.Max(1,featureCount),16,contact?.features,detect);
                     contactBuffer=Buffer("Contacts",Math.Max(1,featureCount*2),56,null,detect,predict,relax,measure);
                     var topology=contact?.topology;
                     Buffer("Regions",Math.Max(1,featureCount),36,topology?.regions,detect);
@@ -369,6 +373,8 @@ namespace Foliage
                     }
                     var oldMeasure=Buffer("OldMeasure",Math.Max(1,structuralCount),4,null,cacheRestMotion,relax,measure);
                     if(figClusterRelax>=0){
+                        gpu.SetBuffer(figContactTarget,"Features",featureBuffer);
+                        gpu.SetBuffer(figContactTarget,"Elements",elementBuffer);
                         gpu.SetBuffer(figTrialEnergy,"Inertia",inertia);
                         gpu.SetBuffer(figTrialEnergy,"Elements",elementBuffer);
                         gpu.SetBuffer(figTrialEnergy,"FigDual",figDual);
@@ -376,9 +382,13 @@ namespace Foliage
                     }
                     gpu.SetInt("StructuralCount",structuralCount);
                     Buffer("RodCounts",Count,4,rodCounts,predict,relax);
-                    Buffer("Offsets",offsets.Length,4,offsets,predict,relax,measure,prepareFall);
-                    Buffer("Incident",flat.Count,4,flat.ToArray(),predict,relax,measure,prepareFall);
-                    var orderedNodes=Buffer("GroupNodes",Math.Max(1,groupNodes.Count),4,groupNodes.Count>0?groupNodes.ToArray():null,relax);
+                    var offsetBuffer=Buffer("Offsets",offsets.Length,4,offsets,predict,relax,measure,prepareFall);
+                    var incidentBuffer=Buffer("Incident",flat.Length,4,flat,predict,relax,measure,prepareFall);
+                    if(figClusterRelax>=0){
+                        gpu.SetBuffer(figContactTarget,"Offsets",offsetBuffer);
+                        gpu.SetBuffer(figContactTarget,"Incident",incidentBuffer);
+                    }
+                    var orderedNodes=Buffer("GroupNodes",Math.Max(1,groupNodes.Length),4,groupNodes.Length>0?groupNodes:null,relax);
                     if(figClusterRelax>=0)BuildFigTiles(orderedNodes);
                     Buffer("Groups",Count,4,colors,predict,relax,measure);
                     sampleBuffer=Buffer("Samples",Count,56,null,measure);
@@ -401,18 +411,55 @@ namespace Foliage
             var upload=uploadTopology;uploadTopology=null;
             upload();
         }
-        void AddRods(RodPlant plant,List<Element> elements,List<int>[] incident,float[] mass)
+        void AddRods(RodPlant plant,List<Element> elements,float[] mass)
         {
             var rods=plant.geometry.rods; var p=plant.rest;
             void Register(Element e)
             {
-                int id=elements.Count;
                 elements.Add(e);
-                foreach(int v in new[]{e.a,e.b,e.c,e.d,e.extra}) if(v>=0) incident[v].Add(id);
             }
             void Spring(int a,int b,float stiffness,bool centerline=false)
             {
                 Register(new Element{kind=1,a=a,b=b,c=-1,d=-1,extra=-1,rest=Vector3.Distance(p[a],p[b]),angle=stiffness,materialScale=centerline?1:0});
+            }
+            // Identify the woody paths carrying the fig canopy, including its outer
+            // scaffold. Aerial roots and leaf stalks keep their own materials.
+            var clusters=plant.geometry.twigClusters;
+            int[] twigStart=null;
+            if(clusters.Count>0){
+                twigStart=new int[rods.Count];
+                Array.Fill(twigStart,-1);
+                foreach(var cluster in clusters){
+                    for(int r=cluster.firstRod;r<cluster.endRod;r++)
+                        if(rods[r].part==0)twigStart[r]=cluster.firstRod;
+                    for(int r=plant.parent[cluster.firstRod];r>=0 && twigStart[r]<0;r=plant.parent[r])
+                        twigStart[r]=0;
+                }
+            }
+            void AddTwigBendingSpan(int tip){
+                if(twigStart==null || twigStart[tip]<0 || rods[tip].woodRigidityGain>=1)return;
+                // A tapered cantilever's lateral compliance is the integral of
+                // distance-to-tip squared / EI. Couple a short span directly to
+                // its proximal material frame so a load needn't pass joint by joint.
+                float length=0,compliance=0;
+                int root=tip;
+                for(int n=0;n<4;n++){
+                    var segment=rods[root];
+                    float next=length+Vector3.Distance(p[segment.a],p[segment.b]);
+                    float rigidity=5.8f*Mathf.Pow(segment.radius/.028f,4);
+                    compliance+=(next*next*next-length*length*length)/(3*rigidity);
+                    length=next;
+                    int ancestor=plant.parent[root];
+                    if(ancestor<0)return;
+                    if(n==3 || ancestor<twigStart[tip] || rods[ancestor].woodRigidityGain>=1){
+                        var socket=rods[ancestor];
+                        Vector3 offset=Quaternion.Inverse(plant.restFrames[ancestor])*(p[rods[tip].b]-p[socket.b]);
+                        Register(new Element{kind=3,a=socket.a,b=socket.b,c=plant.Ghost(ancestor),d=rods[tip].b,extra=-1,
+                            rest=1.5f/compliance,reference=new Vector4(offset.x,offset.y,offset.z,0)});
+                        break;
+                    }
+                    root=ancestor;
+                }
             }
             var rootedTrunk=new Dictionary<int,int>();
             for(int i=0;i<rods.Count;i++)
@@ -445,6 +492,7 @@ namespace Foliage
                 }
                 if(plant.parent[i]<0) continue;
                 int parent=plant.parent[i];
+                AddTwigBendingSpan(i);
                 var previous=rods[parent];
                 Quaternion q=Quaternion.Inverse(plant.restFrames[parent])*plant.restFrames[i];
                 float dual=(Vector3.Distance(p[previous.a],p[previous.b])+len)*.5f;
@@ -654,7 +702,7 @@ namespace Foliage
                 gpu.Dispatch(figDualKernel,dualBlocks,1,1);
                 gpu.SetInt("FigBeginStep",0);
             }
-            bool coarseRecovery=figClusterRelax>=0 && !collide && !self && gravityScale==0 && grabFace<0 && grabRod<0;
+            bool coarseRecovery=figClusterRelax>=0 && !self && !selfContact.safeguarding && gravityScale==0 && grabFace<0 && grabRod<0;
             if(figClusterRelax>=0){
                 float guess=.7f;
                 // Suppress extrapolation as the worst node approaches the 1 mm
@@ -689,9 +737,11 @@ namespace Foliage
             }
             if(selective)gpu.Dispatch(figFollow,blocks,1,1);
             if(coarseRecovery){
+                SetFigRecoveryTarget(collide,blocks);
                 gpu.Dispatch(figTrialEnergy,figTrialGroups,1,1);
                 gpu.Dispatch(figChooseTrial,1,1,1);
                 gpu.Dispatch(figApplyTrial,blocks,1,1);
+                if(collide)gpu.Dispatch(detect,contactBlocks,1,1);
                 if(!figSummaryOnly){
                     gpu.SetInt("Sweep",iterations-1);
                     gpu.Dispatch(measure,blocks,1,1);

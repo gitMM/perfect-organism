@@ -11,9 +11,9 @@ namespace Foliage
         bool fullFigSweeps,figWasGrabbed;
         internal bool FigSelectiveStep {get;private set;}
         internal ComputeBuffer FigStates=>figStates;
-        int figTrialEnergy,figChooseTrial,figApplyTrial,figTrialGroups;
+        int figContactTarget,figTrialEnergy,figChooseTrial,figApplyTrial,figTrialGroups;
         int figTwigNodes;
-        ComputeBuffer figStates,figRanges,figRest;
+        ComputeBuffer figStates,figRanges,figRest,figSafeTarget;
         int[] initialFigStates;
 
         void BuildFigClusters(float[] mass,ComputeBuffer baseMass)
@@ -49,10 +49,12 @@ namespace Foliage
                 return buffer;
             }
             initialFigStates=new int[count];initialFigStates[0]=30;
+            figContactTarget=gpu.FindKernel("FigContactTarget");
             figTrialEnergy=gpu.FindKernel("FigTrialEnergy");
             figChooseTrial=gpu.FindKernel("FigChooseTrial");
             figApplyTrial=gpu.FindKernel("FigApplyTrial");
-            figRest=Bind("FigRest",rest,12,figWake,figTrialEnergy,figApplyTrial);
+            figRest=Bind("FigRest",rest,12,figWake,figTrialEnergy,figApplyTrial,figContactTarget);
+            gpu.SetBuffer(figContactTarget,"X",x);
             figTrialGroups=(Mathf.Max(Count,structuralCount)+127)/128;
             gpu.SetInt("FigTrialGroupCount",figTrialGroups);
             Bind("FigTrialGroups",new Vector3[figTrialGroups],12,figTrialEnergy,figChooseTrial);
@@ -75,6 +77,21 @@ namespace Foliage
             gpu.SetBuffer(figWake,"X",x);
             gpu.SetBuffer(figFollow,"Old",oldPositions);
             gpu.SetBuffer(figFollow,"X",x);
+        }
+
+        void SetFigRecoveryTarget(bool collide,int blocks)
+        {
+            if(collide){
+                if(figSafeTarget==null){
+                    figSafeTarget=new ComputeBuffer(Count,12);
+                    buffers.Add(figSafeTarget);
+                    gpu.SetBuffer(figContactTarget,"FigSafeTarget",figSafeTarget);
+                }
+                gpu.Dispatch(figContactTarget,blocks,1,1);
+            }
+            var target=collide?figSafeTarget:figRest;
+            gpu.SetBuffer(figTrialEnergy,"FigRest",target);
+            gpu.SetBuffer(figApplyTrial,"FigRest",target);
         }
 
         int figClearTiles,figCollectTiles;

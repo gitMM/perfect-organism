@@ -9,6 +9,7 @@
 #pragma kernel FigClusterRelax FIG_SELECTIVE
 #pragma kernel UpdateFigDual
 #pragma kernel FigWakeClusters
+#pragma kernel FigContactTarget
 #pragma kernel FigTrialEnergy
 #pragma kernel FigChooseTrial
 #pragma kernel FigApplyTrial
@@ -379,6 +380,33 @@ float3 ReduceTrial(uint lane,float3 value)
     return trialShared[0];
 }
 static const float3 FigFractions=float3(.0125,.06,.25);
+RWStructuredBuffer<float3> FigSafeTarget;
+[numthreads(64,1,1)]
+void FigContactTarget(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count)return;
+    float3 p=X[id],dir=FigRest[id]-p;
+    float travel=length(dir)*FigFractions.z;
+    float limit=UseOgc!=0?min(travel,.45*QueryRadius):travel;
+    float4 inv=float4(-ObstacleRotation.xyz,ObstacleRotation.w);
+    for(int j=Offsets[id];j<Offsets[id+1];j++){
+        Element e=Elements[Incident[j]];
+        if(e.kind!=4)continue;
+        Feature f=Features[(int)e.rest];
+        float3 a=Turn(inv,X[f.a]-ObstacleCenter),b=Turn(inv,X[f.b]-ObstacleCenter);
+        float3 c=f.c>=0?Turn(inv,X[max(0,f.c)]-ObstacleCenter):b;
+        float3 lo=min(a,min(b,c)),hi=max(a,max(b,c));
+        for(int wall=0;wall<WallCount;wall++){
+            float3 center=float3(wall==0?WallOffset:-WallOffset,0,0);
+            float3 gap=max(0,max(lo-center-Extents,center-Extents-hi));
+            float clearance=length(gap)-f.skin-(UseOgc!=0?ContactOffset:0);
+            limit=min(limit,.45*max(0,clearance));
+        }
+    }
+    // Each endpoint's largest trial stays within the clearance of every
+    // incident rod/face, which also bounds every interpolated point on it.
+    FigSafeTarget[id]=p+dir*(limit/max(travel,1e-12));
+}
 [numthreads(128,1,1)]
 void FigTrialEnergy(uint id:SV_DispatchThreadID,uint lane:SV_GroupIndex,uint3 group:SV_GroupID)
 {
