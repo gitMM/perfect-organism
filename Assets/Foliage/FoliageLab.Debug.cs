@@ -11,6 +11,21 @@ namespace Foliage
         static readonly string[] tabs={"Plant","Inspect","Clock"};
         static readonly string[] picks={"Element","Node","Part","Plant"};
         bool wire,vertices,normalView,winding,connectivity,attachments,ids,invalid=true,interaction=true;
+        bool debugRendering=true;
+        void SetDebugRendering(bool enabled)
+        {
+            if(debugRendering==enabled)return;
+            debugRendering=enabled;
+            if(Sheet!=null && Sheet.plant==null)RefreshSheetMesh();
+        }
+        const string TenCapsuleTest="10 plants + circling player";
+        const string HundredCapsuleTest="100 plants + circling player";
+        void OpenCapsulePreset(int count)
+        {
+            sheetTab=0;
+            expandBranchSettings=false;
+            StartPlayerCapsuleTest(count);
+        }
         float debugScale=1;
         string seedText;
         static float Slider(string name,float value,float min,float max,string format="0.00")
@@ -20,7 +35,7 @@ namespace Foliage
         }
         void OnGUI()
         {
-            if(Geometry==null) return;
+            if(Geometry==null || CompactBranchPanel) return;
             float scale=UiScale;
             GUI.matrix=Matrix4x4.Scale(new Vector3(scale,scale,1));
             // The camera only clears its viewport; explicitly clear the inspector on each repaint.
@@ -37,6 +52,9 @@ namespace Foliage
                 else if(workspace==2) OpenLeaf(selected.valid && selected.part>=2 && selected.part%2==0 ? selected.part/2-1 : leafIndex);
                 else SetSheetMode(workspace==1);
             }
+            SetDebugRendering(GUILayout.Toggle(debugRendering,"Debug rendering"));
+            if(GUILayout.Button(TenCapsuleTest)) { OpenCapsulePreset(10);GUIUtility.ExitGUI(); }
+            if(GUILayout.Button(HundredCapsuleTest)) { OpenCapsulePreset(100);GUIUtility.ExitGUI(); }
             if(Sheet!=null)
             {
                 DrawSheetPanel();
@@ -53,7 +71,7 @@ namespace Foliage
                 if(int.TryParse(seedText,out int seed)) settings.seed=seed;
                 settings.height=Slider("Height (m)",settings.height,.6f,4);
                 settings.radius=Slider("Stem radius (m)",settings.radius,.012f,.065f,"0.000");
-                settings.leaves=Mathf.RoundToInt(Slider("Leaf count",settings.leaves,1,settings.forked?24:16,"0"));
+                settings.leaves=Mathf.RoundToInt(Slider("Leafy shoots",settings.leaves,1,settings.forked?24:16,"0"));
                 settings.width=Slider("Blade width / length",settings.width,.08f,.48f);
                 settings.curvature=Slider("Curvature",settings.curvature,0,1);
                 settings.resolution=Mathf.RoundToInt(Slider("Resolution",settings.resolution,4,20,"0"));
@@ -103,7 +121,7 @@ namespace Foliage
             GUILayout.Label("Left drag  ·  preview grab target\nWheel  ·  zoom / target depth\nRight drag  ·  orbit     Middle  ·  pan\nWASD  ·  fly     Q / E  ·  down / up");
             GUILayout.EndScrollView();
             GUILayout.EndArea();
-            if(ids)
+            if(debugRendering && ids)
             {
                 LabelAt(Geometry.nodes[0],"0  Stem");
                 for(int i=0;i<Geometry.joints.Count;i++)
@@ -152,7 +170,7 @@ namespace Foliage
         static void Outline(Vector3 a,Vector3 b,Vector3 c) { Line(a,b); Line(b,c); Line(c,a); }
         void OnRenderObject()
         {
-            if(Camera.current!=view || Geometry==null) return;
+            if(!debugRendering || Camera.current!=view || Geometry==null) return;
             if(Sheet!=null) { DrawSheetOverlay(); return; }
             var g=Geometry;
             float r=.009f*debugScale;

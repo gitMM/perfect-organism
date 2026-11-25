@@ -7,6 +7,50 @@ public static class PlantCutChecks
 {
     [MenuItem("Tools/Foliage/Check cutting")]
     public static void Run()=>Debug.Log(Check());
+    [MenuItem("Tools/Foliage/Check detached leaf release")]
+    public static void CheckRelease()
+    {
+        var lab=UnityEngine.Object.FindFirstObjectByType<FoliageLab>();
+        if(!Application.isPlaying || lab==null)throw new InvalidOperationException("Enter Play mode first.");
+        var previous=lab.settings;
+        bool paused=lab.paused;
+        try
+        {
+            lab.paused=true;
+            lab.SetSheetMode(false);
+            lab.settings=PlantSettings.Default;
+            lab.Rebuild();
+            lab.OpenStems();
+            var rows=lab.Geometry.bladeRows[0];
+            var root=lab.Sheet.rest[rows[0][0]];
+            int tip=rows[rows.Count-1][0];
+            var end=lab.Sheet.rest[tip];
+            if(!lab.SliceLeaf(0,new Plane((end-root).normalized,Vector3.Lerp(end,root,.4f))))
+                throw new Exception("Could not cut the blade.");
+            var sheet=lab.Sheet;
+            var geom=lab.Geometry;
+            int fragment=geom.ComponentOf(tip);
+            var start=(Vector3[])sheet.positions.Clone();
+            sheet.gravityScale=0;
+            for(int i=0;i<120;i++)lab.Advance();
+            for(int i=0;i<geom.nodes.Count;i++)
+                if(geom.ComponentOf(i)==fragment && Vector3.Distance(start[i],sheet.positions[i])>.001f)
+                    throw new Exception("The resting cut fragment moved without an external load.");
+            sheet.gravityScale=1;
+            for(int i=0;i<60;i++)lab.Advance();
+            if(sheet.badVertex>=0 || start[tip].y-sheet.positions[tip].y<.3f)
+                throw new Exception("The released blade failed to fall.");
+            Debug.Log("Detached leaf stayed at rest without gravity and fell when gravity resumed.");
+        }
+        finally
+        {
+            lab.SetSheetMode(false);
+            lab.settings=previous;
+            lab.Rebuild();
+            lab.OpenStems();
+            lab.paused=paused;
+        }
+    }
     public static string Check()
     {
         var lab=UnityEngine.Object.FindFirstObjectByType<FoliageLab>();

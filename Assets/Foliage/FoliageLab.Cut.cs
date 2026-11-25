@@ -1,3 +1,4 @@
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace Foliage
@@ -5,18 +6,34 @@ namespace Foliage
     public partial class FoliageLab
     {
         PlantGeometry uncutGeometry;
-        bool cutTool,cutting;
+        readonly System.Collections.Generic.HashSet<int> rootedComponents=new();
+        bool cutTool,cutting,highlightDetached;
         int cutRod=-1,cutFace=-1;
         Vector2 cutStart,cutEnd;
         float cutDepth,cutFraction;
         readonly System.Collections.Generic.List<Vector2Int> splitPoints=new(),removedLinks=new(),newLinks=new();
         string cutMessage;
 
+        sealed class PreparedCut
+        {
+            public PlantCut cut;
+            public VbdSheet next;
+            public readonly System.Collections.Generic.List<Vector2Int> removed=new(),added=new();
+            public string error;
+        }
+        Task<PreparedCut> preparingCut;
+        VbdSheet cutSource;
+        Vector2 preparedEnd;
+        bool releasePending;
         public bool BeginCut(Vector2 screen)
         {
-            if(Sheet?.plant==null || !BeginPlantGrab(view.ScreenPointToRay(screen)))return false;
+            if(releasePending || Sheet?.plant==null)return false;
+            FinishQueuedTick();
+            if(!BeginPlantGrab(view.ScreenPointToRay(screen)))return false;
             cutRod=inspectedRod;cutFace=inspectedFace;cutFraction=rodFraction;
-            cutDepth=depth;cutStart=cutEnd=screen;EndDrag();cutting=true;return true;
+            cutDepth=depth;cutStart=cutEnd=screen;EndDrag();cutting=true;
+            if(cutRod>=0)StartPreparingCut();
+            return true;
         }
         Plane StrokePlane()
         {
@@ -24,46 +41,121 @@ namespace Foliage
             Vector3 b=view.ScreenToWorldPoint(new Vector3(cutEnd.x,cutEnd.y,cutDepth));
             return new Plane(Vector3.Cross(b-a,view.ScreenPointToRay(cutStart).direction).normalized,a);
         }
-        public bool FinishCut(Vector2 screen)
+        static PreparedCut Prepare(VbdSheet source,PlantCut cut,int rod,float fraction,int face,Plane plane,bool gpuSkin)
         {
-            if(!cutting)return false;
-            cutting=false;cutEnd=screen;
-            if(cutRod>=0)return CutStem(cutRod,cutFraction);
-            return (cutEnd-cutStart).sqrMagnitude>=16 && SliceLeaf(cutFace,StrokePlane());
-        }
-        public bool CutStem(int rod,float along)
-        {
-            if(Sheet?.plant==null)return false;
-            var cut=new PlantCut(Sheet);
-            return cut.Rod(rod,along) && ApplyCut(cut);
-        }
-        public bool SliceLeaf(int face,Plane plane)
-        {
-            if(Sheet?.plant==null || plane.normal.sqrMagnitude<.5f)return false;
-            var cut=new PlantCut(Sheet);
-            return cut.Blade(face,plane) && ApplyCut(cut);
-        }
-        bool ApplyCut(PlantCut cut)
-        {
+            var result=new PreparedCut{cut=cut};
+            if(!(rod>=0?cut.Rod(rod,fraction):cut.Blade(face,plane)))return result;
             cut.g.Validate();
-            if(cut.g.issues.Count>0){cutMessage=cut.g.issues[0];return false;}
+            if(cut.g.issues.Count>0){result.error=cut.g.issues[0];return result;}
             cut.BuildSkin();
-            var next=new VbdSheet(plant:new RodPlant(cut.g));
-            try{next.ContinueCut(Sheet,cut);}catch{next.Dispose();throw;}
+            var plant=new RodPlant(cut.g,source.plant,cut);
+            result.next=new VbdSheet(null,plant,true);
             static System.Collections.Generic.HashSet<Vector2Int> Links(VbdSheet s)
             {
                 var links=new System.Collections.Generic.HashSet<Vector2Int>(s.edges);
                 foreach(var r in s.plant.geometry.rods)links.Add(new Vector2Int(Mathf.Min(r.a,r.b),Mathf.Max(r.a,r.b)));
                 return links;
             }
-            var before=Links(Sheet);var after=Links(next);
-            removedLinks.Clear();newLinks.Clear();
-            foreach(var edge in before)if(!after.Contains(edge))removedLinks.Add(edge);
-            foreach(var edge in after)if(!before.Contains(edge))newLinks.Add(edge);
-            EndDrag();uncutGeometry??=Geometry;Geometry=cut.g;
-            Sheet.Dispose();Sheet=next;inspectedFace=inspectedRod=-1;
+            var before=Links(source);var after=Links(result.next);
+
+            foreach(var edge in before)if(!after.Contains(edge))result.removed.Add(edge);
+            foreach(var edge in after)if(!before.Contains(edge))result.added.Add(edge);
+            if(gpuSkin)result.next.PrepareRenderData(null,cut,source);
+            return result;
+        }
+        void StartPreparingCut()
+        {
+            cutSource=Sheet;preparedEnd=cutEnd;
+            var source=Sheet;var snapshot=new PlantCut(source);
+            int rod=cutRod,face=cutFace;float fraction=cutFraction;
+            Plane plane=rod>=0?default:StrokePlane();
+            bool gpuSkin=settings.PlantCount>1;
+            // Snapshot moving nodes on the main thread. All topology and render-data
+            // preparation below uses managed data; GPU resources are created at commit.
+            preparingCut=Task.Run(()=>
+            {
+                try{return Prepare(source,snapshot,rod,fraction,face,plane,gpuSkin);}
+                catch(System.Exception e){return new PreparedCut{error=e.ToString()};}
+            });
+        }
+        void PreviewCut(Vector2 screen)
+        {
+            cutEnd=screen;
+            if(cutRod<0 && (screen-cutStart).sqrMagnitude>=16 &&
+                (preparingCut==null || preparingCut.IsCompleted && (preparedEnd-screen).sqrMagnitude>=9))
+                StartPreparingCut();
+        }
+        void ReleaseCut(Vector2 screen)
+        {
+            cutEnd=screen;
+            if(cutRod<0 && (cutEnd-cutStart).sqrMagnitude<16)
+            {CancelCut();return;}
+            releasePending=true;
+            CompleteRelease(false);
+        }
+        bool CompleteRelease(bool wait)
+        {
+            if(preparingCut==null)StartPreparingCut();
+            if(!wait && !preparingCut.IsCompleted)return false;
+            if(cutRod<0 && preparedEnd!=cutEnd)
+            {
+                StartPreparingCut();
+                if(!wait)return false;
+            }
+            var result=preparingCut.GetAwaiter().GetResult();
+            bool current=cutSource==Sheet;
+            CancelCut();
+            return current && CommitCut(result);
+        }
+        void CancelCut()
+        {
+            preparingCut=null;cutSource=null;releasePending=false;cutting=false;
+        }
+        public bool FinishCut(Vector2 screen)
+        {
+            if(!cutting)return false;
+            cutEnd=screen;
+            if(cutRod<0 && (cutEnd-cutStart).sqrMagnitude<16){CancelCut();return false;}
+            return CompleteRelease(true);
+        }
+        public bool CutStem(int rod,float along)
+        {
+            if(Sheet?.plant==null || rod<0)return false;
+            FinishQueuedTick();CancelCut();
+            return CommitCut(Prepare(Sheet,new PlantCut(Sheet),rod,along,-1,default,settings.PlantCount>1));
+        }
+        public bool SliceLeaf(int face,Plane plane)
+        {
+            if(Sheet?.plant==null || plane.normal.sqrMagnitude<.5f)return false;
+            FinishQueuedTick();CancelCut();
+            return CommitCut(Prepare(Sheet,new PlantCut(Sheet),-1,0,face,plane,settings.PlantCount>1));
+        }
+        bool CommitCut(PreparedCut result)
+        {
+            if(result.error!=null){cutMessage=result.error;Debug.LogWarning(cutMessage);return false;}
+            var next=result.next;if(next==null)return false;
+            var cut=result.cut;
+            next.UploadTopology();
+            try{next.ContinueCut(Sheet,cut);}catch{next.Dispose();throw;}
+            EndDrag();
+            var previous=Sheet;
+            try
+            {
+                if(settings.PlantCount>1)next.BindRenderMesh(mesh,cut,previous);
+                else
+                {
+                    mesh.Clear();mesh.SetVertices(cut.g.skin);mesh.triangles=next.plant.skinTriangles;
+                    mesh.SetColors(cut.g.colors);mesh.SetUVs(0,cut.g.bladeUV);
+                }
+            }
+            catch{next.Dispose();throw;}
+            uncutGeometry??=Geometry;Geometry=cut.g;
+            removedLinks.Clear();removedLinks.AddRange(result.removed);
+            newLinks.Clear();newLinks.AddRange(result.added);
+            rootedComponents.Clear();
+            foreach(int node in Geometry.rootNodes)rootedComponents.Add(Geometry.component[node]);
+            previous.Dispose();Sheet=next;inspectedFace=inspectedRod=-1;
             sheetColors=new Color[next.Count];strains=new float[next.Count];
-            mesh.Clear();mesh.SetVertices(Geometry.skin);mesh.triangles=next.plant.skinTriangles;mesh.SetColors(Geometry.colors);
             RefreshSheetMesh();
             splitPoints.Clear();splitPoints.AddRange(cut.seam);
             cutMessage=$"{Geometry.islands} components · {cut.seam.Count} split points · {cut.replacedFaces} triangles split";
@@ -71,6 +163,7 @@ namespace Foliage
         }
         void RestoreGeometry()
         {
+            CancelCut();
             if(uncutGeometry!=null)Geometry=uncutGeometry;
             uncutGeometry=null;splitPoints.Clear();cutMessage=null;cutting=false;cutTool=false;
         }
@@ -79,7 +172,8 @@ namespace Foliage
             cutTool=GUILayout.Toolbar(cutTool?1:0,new[]{"Grab","Cut"})==1;
             if(cutTool)GUILayout.Label("Click a stem to cut. On a leaf, drag along the cut line and release.");
             if(cutMessage!=null)GUILayout.Label(cutMessage);
-            if(sheetTab!=0 && splitPoints.Count>0)GUILayout.Label($"Removed links (red) {removedLinks.Count} · New links (green) {newLinks.Count}\nDetached components have colored outlines.");
+            if(sheetTab!=0 && splitPoints.Count>0)highlightDetached=GUILayout.Toggle(highlightDetached,"Highlight detached pieces");
+            if(sheetTab!=0 && splitPoints.Count>0)GUILayout.Label($"Removed links (red) {removedLinks.Count} · New links (green) {newLinks.Count}");
         }
         void DrawCutOverlay()
         {
@@ -110,11 +204,14 @@ namespace Foliage
             if(splitPoints.Count==0 || sheetTab==0)return;
             void ComponentEdge(int a,int b)
             {
-                int id=Geometry.component[a];if(id==Geometry.component[0])return;
+                int id=Geometry.component[a];if(rootedComponents.Contains(id))return;
                 GL.Color(Color.HSVToRGB(Mathf.Repeat(id*.618f,1),.8f,1));Line(Sheet.positions[a],Sheet.positions[b]);
             }
-            foreach(var e in Sheet.edges)ComponentEdge(e.x,e.y);
-            foreach(var r in Geometry.rods)ComponentEdge(r.a,r.b);
+            if(highlightDetached)
+            {
+                foreach(var e in Sheet.edges)ComponentEdge(e.x,e.y);
+                foreach(var r in Geometry.rods)ComponentEdge(r.a,r.b);
+            }
             GL.Color(Color.red);foreach(var e in removedLinks)Line(Sheet.positions[e.x],Sheet.positions[e.y]);
             GL.Color(Color.green);foreach(var e in newLinks)Line(Sheet.positions[e.x],Sheet.positions[e.y]);
             foreach(var pair in splitPoints)

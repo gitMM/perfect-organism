@@ -14,15 +14,17 @@ namespace Foliage
             if(obstacleMesh!=null)Destroy(obstacleMesh);
             obstacleObject=null;obstacleMesh=null;movingSphere=false;
         }
-        public void SetObstacle(ObstacleShape shape,Vector3 start,Quaternion orientation,float radius=.15f,float opening=.06f)
+        public void SetObstacle(ObstacleShape shape,Vector3 start,Quaternion orientation,float radius=.15f,float opening=.06f,float capsuleHalfHeight=0)
         {
+            FinishQueuedTick();
             EndDrag();ClearObstacle();
-            var contact=Sheet.contact; contact.Configure(shape,start,orientation,radius,opening);
+            var contact=Sheet.contact; contact.Configure(shape,start,orientation,radius,opening,capsuleHalfHeight);
             if(shape==ObstacleShape.Off)return;
+            Sheet.ResolveObstacleSpawn();
             var type=shape==ObstacleShape.Box || shape==ObstacleShape.Gate?PrimitiveType.Cube:shape==ObstacleShape.Capsule?PrimitiveType.Capsule:PrimitiveType.Sphere;
             obstacleObject=GameObject.CreatePrimitive(type);
             obstacleObject.name="Foliage obstacle · "+shape;
-            obstacleObject.transform.SetPositionAndRotation(start,orientation);
+            obstacleObject.transform.SetPositionAndRotation(contact.center,orientation);
             Vector3 size=2*contact.extents;
             if(shape==ObstacleShape.Capsule)
             {
@@ -48,7 +50,7 @@ namespace Foliage
             {
                 var first=obstacleObject;
                 obstacleObject=new GameObject("Foliage obstacle · Narrow gap");
-                obstacleObject.transform.SetPositionAndRotation(start,orientation);
+                obstacleObject.transform.SetPositionAndRotation(contact.center,orientation);
                 first.transform.SetParent(obstacleObject.transform,true);
                 first.transform.localPosition=contact.WallOffset(0);
                 var second=Instantiate(first,obstacleObject.transform);
@@ -56,9 +58,20 @@ namespace Foliage
             }
             Physics.SyncTransforms();
         }
+        public void StartPlayerCapsuleTest(int count=10)
+        {
+            SetBranchPreset(true,count);
+            if(Sheet?.plant==null)OpenStems();
+            var pivot=settings.OrbitPivot+Vector3.up*.9f;
+            float radius=PlantContact.OrbitRadius(count);
+            SetObstacle(ObstacleShape.Capsule,pivot+Vector3.right*radius,Quaternion.identity,.30f,capsuleHalfHeight:.90f);
+            Sheet.contact.StartPlayerOrbit(pivot,radius);
+            lastClockTime=Time.realtimeSinceStartupAsDouble;
+            paused=false;
+        }
         public bool BeginLabDrag(Ray ray)
         {
-            if(obstacleObject==null)return BeginSheetPick(ray);
+            if(obstacleObject==null || Sheet.contact.playerOrbit)return BeginSheetPick(ray);
             Physics.SyncTransforms();
             RaycastHit hit=default;float nearest=100;
             foreach(var collider in obstacleObject.GetComponentsInChildren<Collider>())
@@ -73,6 +86,11 @@ namespace Foliage
             depth=Mathf.Clamp(depth*Mathf.Exp(wheel*.08f),.08f,40);
             Sheet.contact.target=view.ScreenToWorldPoint(new Vector3(screen.x,screen.y,depth))+sphereOffset;
         }
+        void SelectLabObstacle(ObstacleShape shape)
+        {
+            SetObstacle(shape,new Vector3(-.48f,.56f,-.12f)*settings.height,
+                shape==ObstacleShape.Sphere?Quaternion.identity:Quaternion.Euler(8,16,-15),settings.height*.075f);
+        }
         void DrawObstaclePanel(bool inspect)
         {
             var contact=Sheet.contact;
@@ -84,10 +102,15 @@ namespace Foliage
             if(inspect && Sheet.selfContact.enabled)
                 GUILayout.Label($"Self-contacts {Sheet.selfContact.active}   Penetration {Sheet.selfContact.penetration*1000:F2} mm");
             GUILayout.Label("Test collider");
+            if(GUILayout.Button(contact.playerOrbit?"Stop player capsule":"Player capsule orbit"))
+            {
+                if(contact.playerOrbit)SelectLabObstacle(ObstacleShape.Off);
+                else StartPlayerCapsuleTest(settings.PlantCount==100?100:10);
+                return;
+            }
             var shape=(ObstacleShape)GUILayout.SelectionGrid((int)contact.shape,obstacleNames,2,GUILayout.Width(PanelWidth-34));
             if(shape!=contact.shape)
-                SetObstacle(shape,new Vector3(-.48f,.56f,-.12f)*settings.height,
-                    shape==ObstacleShape.Sphere?Quaternion.identity:Quaternion.Euler(8,16,-15),settings.height*.075f);
+                SelectLabObstacle(shape);
             if(shape==ObstacleShape.Off)return;
             if(shape==ObstacleShape.Gate)GUILayout.Label($"Gate opening   {contact.gapWidth*1000:F1} mm");
             contact.model=(ContactModel)GUILayout.SelectionGrid((int)contact.model,new[]{"Penalty","OGC"},2);
@@ -109,10 +132,10 @@ namespace Foliage
             }
             else GUILayout.Label("Drag the collider or the plant. Scroll while dragging to adjust depth.");
         }
-        void DrawContactOverlay()
+        void DrawContactOverlay(bool batched)
         {
             var c=Sheet.contact;
-            if(showContacts && Sheet.selfContact.enabled)
+            if(!batched && showContacts && Sheet.selfContact.enabled)
             {
                 GL.Color(Color.magenta);
                 foreach(var p in Sheet.selfContact.points)Cross(p,.006f*debugScale);
@@ -134,9 +157,9 @@ namespace Foliage
                     }
                 }
             }
-            for(int i=0;i<c.hits.Length;i++)
+            foreach(int i in c.candidateSlots)
             {
-                var h=c.hits[i]; if(h.candidate==0)continue;
+                var h=c.hits[i];
                 var f=c.features[i%c.features.Length];
                 if(showCandidates)
                 {

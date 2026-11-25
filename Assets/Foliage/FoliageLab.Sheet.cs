@@ -13,7 +13,7 @@ namespace Foliage
         bool showRest,showVein=true;
         static readonly string[] leafMaps={"Surface","Strain","Bending","Motion"};
         bool showEdges=true,showPins=true,showGroups,showVelocity,showForce,showParticles,showEnergy;
-        bool sphereWasActive;
+        bool sphereWasActive,expandBranchSettings;
         public void SetSheetMode(bool enabled)
         {
             if(enabled && Sheet!=null && Sheet.leaf==null && Sheet.plant==null || !enabled && Sheet==null) return;
@@ -28,7 +28,7 @@ namespace Foliage
             {
                 RestoreGeometry();
                 ClearObstacle();
-                Sheet.Dispose(); Sheet=null;
+                Sheet.Dispose(); Sheet=null;crossSheet=graphSheet=null; UpdateBranchFramePacing();
                 testSphere.gameObject.SetActive(sphereWasActive);
                 Rebuild(); Frame();
             }
@@ -37,12 +37,13 @@ namespace Foliage
         {
             ClearObstacle();
             if(Sheet==null) sphereWasActive=testSphere.gameObject.activeSelf;
-            Sheet?.Dispose(); Sheet=surface; testSphere.gameObject.SetActive(false);
+            Sheet?.Dispose(); crossSheet=graphSheet=null;Sheet=surface; UpdateBranchFramePacing(); testSphere.gameObject.SetActive(false);
             sheetColors=new Color[Sheet.Count]; strains=new float[Sheet.Count];
             mesh.Clear();
             if(Sheet.plant!=null)
             {
-                mesh.SetVertices(Geometry.skin); mesh.triangles=Sheet.plant.skinTriangles; mesh.SetColors(Geometry.colors);
+                mesh.SetVertices(Geometry.skin); mesh.triangles=Sheet.plant.skinTriangles; mesh.SetColors(Geometry.colors);mesh.SetUVs(0,Geometry.bladeUV);
+                if(settings.PlantCount>1)Sheet.BindRenderMesh(mesh);
             }
             else { mesh.vertices=Sheet.positions; mesh.triangles=Sheet.triangles; }
             ResetState();
@@ -51,7 +52,18 @@ namespace Foliage
         {
             RestoreGeometry();
             leafIndex=Mathf.Clamp(index,0,Geometry.bladeRows.Count-1);
-            var blade=new LeafSurface(Geometry,leafIndex);
+            var leafGeometry=Geometry;
+            int localIndex=leafIndex;
+            if(Geometry.bladeRows[leafIndex][1].Length<3)
+            {
+                var full=settings;
+                int plant=leafIndex/Geometry.leavesPerPlant;
+                localIndex=leafIndex%Geometry.leavesPerPlant;
+                full.seed=unchecked(full.seed+plant);
+                full.tenPlants=false;full.plantCount=1;full.adaptivePhysics=false;
+                leafGeometry=PlantGeometry.Generate(full);
+            }
+            var blade=new LeafSurface(leafGeometry,localIndex);
             SetSurface(new VbdSheet(blade));
             Vector3 axis=blade.rest[blade.rest.Length-1]-blade.rest[0];
             pivot=blade.rest[0]+axis*.48f-Vector3.up*blade.length*.08f;
@@ -63,13 +75,22 @@ namespace Foliage
         {
             if(Sheet.plant!=null)
             {
-                Sheet.plant.UpdateSkin(Sheet.positions);
                 if(obstacleObject!=null) obstacleObject.transform.position=Sheet.contact.center;
-                mesh.vertices=Sheet.plant.skin; mesh.RecalculateNormals(); mesh.RecalculateBounds();
+                if(Sheet.DrawSkinOnGpu())
+                {
+                    if(Sheet.Steps>0)mesh.bounds=Sheet.SkinBounds;
+                    if(sheetTab!=0 || (debugRendering && (directors || rodMap!=0 || collarErrors)))
+                        Sheet.plant.UpdateSkin(Sheet.positions);
+                }
+                else
+                {
+                    Sheet.plant.UpdateSkin(Sheet.positions);
+                    mesh.vertices=Sheet.plant.skin;mesh.RecalculateNormals();mesh.RecalculateBounds();
+                }
                 return;
             }
             mesh.vertices=Sheet.positions;
-            if(Sheet.leaf!=null && leafMap==1)
+            if(debugRendering && Sheet.leaf!=null && leafMap==1)
             {
                 System.Array.Clear(strains,0,strains.Length);
                 foreach(var edge in Sheet.edges)
@@ -83,14 +104,14 @@ namespace Foliage
             {
                 Color c=Sheet.leaf==null?new Color(.38f,.72f,.64f):
                     Sheet.leaf.midrib[i]?new Color(.44f,.62f,.22f):new Color(.17f,.44f,.20f);
-                if(showGroups && Sheet.colors[i]>=0)
+                if(debugRendering && showGroups && Sheet.colors[i]>=0)
                     c=Color.HSVToRGB((float)Sheet.colors[i]/Sheet.colorCount,.6f,.95f);
-                if(showEnergy)
+                if(debugRendering && showEnergy)
                 {
                     var e=Sheet.samples[i].energy;
                     c=Color.Lerp(new Color(.12f,.23f,.48f),Color.yellow,Mathf.Clamp01((e.x+e.y)/.00001f));
                 }
-                if(Sheet.leaf!=null && leafMap!=0)
+                if(debugRendering && Sheet.leaf!=null && leafMap!=0)
                 {
                     float fraction=leafMap==1?strains[i]/.05f:leafMap==2?Sheet.samples[i].energy.y/.00025f:
                         Vector3.Distance(Sheet.rest[i],Sheet.positions[i])/(Sheet.leaf.length*.5f);
@@ -150,12 +171,28 @@ namespace Foliage
             if(Sheet.badVertex>=0) GUILayout.Label($"Non-finite solver value at node {Sheet.badVertex}");
             if(Sheet.plant!=null)
             {
-                bool dense=GUILayout.Toolbar(settings.forked?1:0,new[]{"Single stem","Branch test"})==1;
-                if(dense!=settings.forked)SetBranchTest(dense);
-                if(settings.forked)GUILayout.Label($"Branch contacts   {Sheet.selfContact.branchContacts}\nPull an outer fork toward its middle branch.");
+                int preset=settings.PlantCount==100?3:settings.tenPlants?2:settings.forked?1:0;
+                int next=GUILayout.Toolbar(preset,new[]{"Single stem","Branch test","10 plants","100 + capsule"});
+                if(next!=preset)
+                {
+                    if(next==3)StartPlayerCapsuleTest(100);
+                    else SetBranchTest(next!=0,next==2);
+                }
+                if(settings.forked)GUILayout.Label($"Branch contacts   {Sheet.selfContact.branchContacts}    Blade contacts   {Sheet.selfContact.bladeContacts}\nPull an outer fork toward its middle branch.");
                 DrawCutPanel();
             }
             if(Sheet.contact!=null)DrawObstaclePanel(sheetTab!=0);
+            if(sheetTab==0 && Sheet.plant!=null && settings.forked)
+            {
+                if(GUILayout.Button(expandBranchSettings?"Hide solver settings":"Show solver settings"))
+                    expandBranchSettings=!expandBranchSettings;
+                if(!expandBranchSettings)
+                {
+                    GUILayout.Label("Left drag to pull. Scroll while holding to move in depth. Release to detach.");
+                    GUILayout.EndScrollView();
+                    return;
+                }
+            }
             if(sheetTab==0)
             {
                 speed=Slider("Clock speed",speed,.1f,4);
@@ -208,13 +245,96 @@ namespace Foliage
             }
             GUILayout.EndScrollView();
         }
+        Material debugCrosses;
+        ComputeBuffer crossPoints,pinPoints;
+        readonly System.Collections.Generic.List<Vector3> pinnedPositions=new();
+        int contactTick=-1,pinTick=-1;
+        VbdSheet crossSheet;
+        void DrawCrosses(System.Collections.Generic.List<Vector3> points,ref ComputeBuffer buffer,ref int uploadedTick,float radius,Color tint)
+        {
+            if(points.Count==0)return;
+            if(!debugCrosses)debugCrosses=new Material(Resources.Load<Shader>("PlantDebugCrosses"));
+            if(buffer==null || buffer.count<points.Count)
+            {
+                buffer?.Release();buffer=new ComputeBuffer(Mathf.NextPowerOfTwo(points.Count),12);
+                uploadedTick=-1;
+            }
+            if(uploadedTick!=Sheet.Steps)
+            {
+                buffer.SetData(points);uploadedTick=Sheet.Steps;
+            }
+            debugCrosses.SetBuffer("Points",buffer);
+            debugCrosses.SetFloat("Radius",radius*debugScale);
+            debugCrosses.SetColor("Tint",tint);
+            debugCrosses.SetPass(0);
+            Graphics.DrawProceduralNow(MeshTopology.Lines,6,points.Count);
+        }
+        void DrawPlantCrosses()
+        {
+            if(crossSheet!=Sheet)
+            {
+                crossSheet=Sheet;pinTick=contactTick=-1;
+            }
+            if(showContacts && Sheet.selfContact.enabled)
+                DrawCrosses(Sheet.selfContact.points,ref crossPoints,ref contactTick,.006f,Color.magenta);
+            if(showPins)
+            {
+                if(pinTick!=Sheet.Steps)
+                {
+                    pinnedPositions.Clear();
+                    foreach(int v in Sheet.pins)pinnedPositions.Add(Sheet.positions[v]);
+                }
+                DrawCrosses(pinnedPositions,ref pinPoints,ref pinTick,.002f,Color.yellow);
+            }
+        }
+
+        Mesh graphLines;
+        VbdSheet graphSheet;
+        int graphTick=-1;
+        bool DrawGraphLines()
+        {
+            if(settings.PlantCount<=1 || Sheet.plant==null)return false;
+            if(!showEdges && (!centers || rodMap!=0))return true;
+            if(graphSheet!=Sheet)
+            {
+                if(!graphLines)graphLines=new Mesh{name="Plant graph lines",indexFormat=UnityEngine.Rendering.IndexFormat.UInt32};
+                graphLines.Clear();
+                graphLines.MarkDynamic();
+                graphLines.vertices=Sheet.positions;
+                graphLines.subMeshCount=2;
+                var edgeIndices=new int[2*Sheet.edges.Count];
+                for(int i=0;i<Sheet.edges.Count;i++){edgeIndices[2*i]=Sheet.edges[i].x;edgeIndices[2*i+1]=Sheet.edges[i].y;}
+                var rodIndices=new int[2*Geometry.rods.Count];
+                for(int i=0;i<Geometry.rods.Count;i++){rodIndices[2*i]=Geometry.rods[i].a;rodIndices[2*i+1]=Geometry.rods[i].b;}
+                graphLines.SetIndices(edgeIndices,MeshTopology.Lines,0,false);
+                graphLines.SetIndices(rodIndices,MeshTopology.Lines,1,false);
+                graphSheet=Sheet;graphTick=Sheet.Steps;
+            }
+            if(graphTick!=Sheet.Steps)
+            {
+                graphLines.SetVertices(Sheet.positions,0,Sheet.Count,UnityEngine.Rendering.MeshUpdateFlags.DontRecalculateBounds);
+                graphTick=Sheet.Steps;
+            }
+            void Draw(int submesh,Color color)
+            {
+                lines.SetColor("_Color",color);
+                lines.SetPass(0);
+                Graphics.DrawMeshNow(graphLines,Matrix4x4.identity,submesh);
+            }
+            if(centers && rodMap==0)Draw(1,Color.cyan);
+            if(showEdges)Draw(0,new Color(.18f,.35f,.35f));
+            lines.SetColor("_Color",Color.white);
+            return true;
+        }
         void DrawSheetOverlay()
         {
             lines.SetInt("_ZTest",(int)UnityEngine.Rendering.CompareFunction.Always);
+            bool batched=DrawGraphLines();
+            if(batched)DrawPlantCrosses();
             lines.SetPass(0); GL.PushMatrix(); GL.Begin(GL.LINES);
-            if(Sheet.plant!=null)DrawRodOverlay();
-            if(Sheet.contact!=null) DrawContactOverlay();
-            if(showEdges)
+            if(Sheet.plant!=null)DrawRodOverlay(batched);
+            if(Sheet.contact!=null) DrawContactOverlay(batched);
+            if(showEdges && !batched)
             {
                 GL.Color(new Color(.18f,.35f,.35f));
                 foreach(var e in Sheet.edges) Line(Sheet.positions[e.x],Sheet.positions[e.y]);
@@ -228,11 +348,12 @@ namespace Foliage
                     { GL.Color(new Color(1,.8f,.24f)); Line(Sheet.positions[edge.x],Sheet.positions[edge.y]); }
                 }
             }
+            if(showParticles || showVelocity || showForce || (!batched && showPins))
             for(int v=0;v<Sheet.Count;v++)
             {
                 var s=Sheet.samples[v]; var p=s.position;
                 if(showParticles){ GL.Color(Color.white); Cross(p,.00065f*debugScale); }
-                if(showPins && Sheet.colors[v]<0){ GL.Color(Color.yellow); Cross(p,.002f*debugScale); }
+                if(!batched && showPins && Sheet.colors[v]<0){ GL.Color(Color.yellow); Cross(p,.002f*debugScale); }
                 if(showVelocity){ GL.Color(Color.cyan); Line(p,p+s.velocity*.05f*debugScale); }
                 if(showForce){ GL.Color(Color.magenta); Line(p,p+s.force*debugScale); }
             }

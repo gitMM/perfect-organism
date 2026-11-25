@@ -225,7 +225,7 @@ In **Stems**, select **Sphere**, **Capsule** or **Box** under **Test collider**.
 
 **Stems → Test collider** defaults to **OGC** and also offers **Penalty**. OGC applies force within a 12 mm offset of the physical skin. Each leaf triangle supplies a witness on its face, an edge or a vertex. Shared edges and vertices have one owner. The deformed neighboring triangles determine whether the contact normal lies in that feature's region. Separate faces in a fold can both contribute. Round obstacles use their center or spine. Boxes use a separating axis and one clipped witness per plant element. Rods use their thick centerline segments.
 
-The GPU refreshes contact geometry before velocity prediction and after each sweep. Node updates and collider translation use 45% of the available clearance as a motion bound. **Inspect** shows the minimum gap, smallest node bound and largest rejected node movement. Starting inside foliage uses limited recovery steps and can cause high strain. The stationary-sphere fixture checks its starting clearance before pulling.
+The GPU refreshes contact geometry before velocity prediction and after each sweep. Node updates and collider translation use 45% of the available clearance as a motion bound. **Inspect** shows the minimum gap, smallest node bound and largest rejected node movement. When a requested collider spawn penetrates foliage, placement moves the collider along contact normals until clear. If opposing surfaces block that correction, the collider starts just above or below the plant. Reset checks clearance again against the restored plant. The stationary-sphere fixture checks its starting clearance before pulling.
 
 On the seed-17 plant with tapered leaves, all six sphere, capsule and box pushes reached the full 170 mm target in both modes. Peak post-step penetration across the pushes was 1.45 mm for Penalty and 0.00 mm at reporting precision for OGC. Mean wall time per step, including readback, ranged from 5.10–7.41 ms for Penalty and 6.47–6.89 ms for OGC in one Editor run.
 
@@ -273,17 +273,85 @@ In Play mode, select **Stems → Cut**. Click a stem or stalk to split it at the
 
 **Inspect** shows the cutting plane and its intersections during a stroke. After release, colored outlines identify detached components, paired crosses mark the seam, and red and green lines show removed and new structural links. The rebuilt solver retains rest shape, current deformation, interpolated velocities and the active obstacle. Fresh cut surfaces begin coincident and become ordinary collision partners once they clear each other's collision skin.
 
+Detached fragments inherit their pre-cut velocities. Gravity advances the whole free fragment during prediction, and air resistance opposes motion normal to its blade surface. **Tools / Foliage / Check detached leaf release** checks for spontaneous movement with gravity off, then checks the fall with gravity on.
+
 **Tools → Foliage → Check cutting** slices a moving blade, checks state transfer, catches its detached tip on a sphere, grabs it again, then cuts a stem inside a segment and at a joint. On the default plant the tip fell 96.3 mm and moved 79.4 mm under the subsequent grab. The three cuts produced four components and reset restored one.
 
 ## Step 7 — Expand the generator
 
 ### Branch test preset
 
-In Play mode, select **Stems → Branch test** to load a 3.2 m plant with six main branches, twelve side forks and eighteen leaves. Each fork curves back toward its parent branch near the tip, so a short sideways drag can bring the two into contact.
+In Play mode, select **Stems → Branch test** to load the seed-17, 3.2 m plant with eight main branches, sixteen side forks and 240 leaves. Main branches spiral up the tapered trunk. Each shoot carries one terminal blade and nine alternating side leaves with short petioles, curved surfaces, midribs and lateral veins. The default unbranched plant has 70 leaves on seven shoots.
 
-Select **Grab**, leave **Plant self-collision** enabled, and pull an outer fork toward the middle branch. Watch **Branch contacts** for active contact points between rod segments belonging to different branches. Select **Single stem** to return to the previous plant settings.
+Leave **Plant self-collision** enabled to see contacts form under gravity, or select **Grab** and drag an outer fork. **Branch contacts** counts active contact points between rods of different branches. **Blade contacts** counts points between different leaves. A pair of leaves can have several contact points. Select **Single stem** to return to the previous plant settings.
 
-In the seed-17 Unity check with gravity disabled, the plant started with zero branch contacts. A mouse drag moved the picked fork about 167 mm and produced one branch contact. In a separate run under normal gravity, the plant registered three simultaneous branch contacts after three simulated seconds.
+#### Initial overlap checks
+
+At generation time, each blade gets the nearest vertical stalk-tip adjustment that clears earlier blades, including both blade skins and the self-contact envelope. This keeps the rendered surface, collar and solver rest shape together. Gravity and grabs can bring the leaves back into ordinary contact.
+
+In Play mode, **Tools / Foliage / Check spawn overlaps** checks unloaded leaf clearance and deliberately embeds a sphere, capsule, box and gate in the canopy under both Penalty and OGC. Run the Windows player with `-benchmarkFoliageSpawn` to time the seed-17 branch preset after placing a 150 mm radius sphere directly on a blade.
+
+With the corrected sphere present, the 1547 x 870 Editor run on a GTX 1070 Ti averaged **102.50 FPS** under gravity and **94.90 FPS** under continuous dragging. The respective 95th-percentile frame times were 13.49 ms and 14.70 ms. Both 12-second passes advanced about 60 physics ticks/s and recorded 0.000 mm peak post-step obstacle penetration.
+
+#### Debug rendering
+
+Use **Debug rendering** in the Plant, Sheet, Leaf or Stems panel to toggle the scene overlays and diagnostic color maps. The switch retains your individual overlay selections as you move between tests. Debug rendering starts enabled. Add `-noFoliageDebugRendering` to any Windows player benchmark command to start with it disabled. The benchmark log includes the setting beside each FPS result.
+
+#### Branched plant performance
+
+In Play mode, run **Tools / Foliage / Benchmark branched plant**. The benchmark warms up for 120 frames, then measures 12 seconds under gravity and 12 seconds with a continuous 18 cm sinusoidal rod grab. The Windows player runs the same benchmark with `-benchmarkBranchedPlant` and returns exit code 1 if either pass averages 60 FPS or less, physics drops below 59 ticks/s, or the solver detects a non-finite node.
+
+Before the spawn-clearance update: Unity 6000.3.24f1 Editor, GeForce GTX 1070 Ti, 1547 × 870 Game view, default Solver panel, external obstacle off. The plant has 629 simulation nodes, 122 rod segments and 480 blade triangles. Both runs used 18 solver sweeps, normal gravity, self-collision and DAT. Contact counts are the separate peaks observed in each pass.
+
+| Editor workload | Average rendered FPS | 95th-percentile frame time | Physics ticks/s | Peak branch contacts | Peak blade contacts |
+|---|---:|---:|---:|---:|---:|
+| Gravity | 108.75 | 12.80 ms | 60.00 | 6 | 13 |
+| Continuous rod drag | 103.06 | 13.52 ms | 60.02 | 5 | 12 |
+
+Branch test turns off vSync while active and restores the previous setting on exit. Its default controls use a retained UI panel. **Show solver settings** exposes the material, sweep and grab controls. **Inspect** enables the per-sweep residual measurements. Normal playback batches self-contact witness searches with Burst and overlaps GPU sample readback with rendering. The following physics tick consumes the completed positions before building its contacts.
+
+#### Player capsule orbit
+
+Select **Player capsule orbit** under **Stems / Test collider**. The upright capsule is 1.80 m tall and 0.60 m wide. It follows a 1.50 m radius circle through the ten-plant fixture at 2.40 m/s. Each lap takes about 3.93 seconds of simulation time. The rooted stems have distributed elastic support along their lengths. The preset starts with penalty contact. With OGC selected, clearance limits can slow the capsule. The panel reports rod and face contacts and penetration. Select **Stop player capsule** to remove it. Launch the Windows build with `-playerCapsuleOrbit` to open the test directly. Use `-benchmarkTenPlantCapsule` to measure the same orbit for 700 ticks. It reports render FPS, physics rate, peak rod elongation and longest continuous contact on a rod. All 2,400 leaves are rendered. Four plants near the orbit use individual collision beams and leaf shells where the player can reach them. The other six use shoot-level collision beams.
+
+#### 100-plant capsule stress test
+
+Select **100 plants + circling player** below **Debug rendering** in the foliage lab. The adjacent **10 plants + circling player** button opens the smaller orbit test. The preset generates a staggered 10 by 10 stand at 1.28 m spacing with seeds 17 through 116. The same player capsule follows a 2.29 m radius circle at 2.40 m/s, completing one lap in about 6.00 seconds of simulation time. Use the debug rendering switch to compare overlay costs. The Windows player accepts `-hundredPlantCapsuleOrbit` for interactive play or `-benchmarkHundredPlantCapsule` for a 700-tick run that logs frame rate, physics rate, capsule travel, contacts and peak penetration.
+
+The 100-plant stand renders 24,000 leaves. Two plants selected by their terminal blades' distance to the orbit use higher-detail physics. Their lower shoots use shell blades and individual leaf beams within reach of the capsule. The other 98 plants use a reduced trunk and shoot-level collision beams. All 100 share the contact solver and its 18 sweeps. Add `-fullDetailFoliage` to either capsule preset to simulate every blade as a shell.
+
+The earlier 0.38 m orbit benchmark at 1547 x 870 on a GTX 1070 Ti used 12,308 physics nodes. A refitted spatial tree finds candidate collisions. GPU kernels deform the render mesh, compute its normals, and solve each plant's structural constraints in color order. Shared contact snapshots couple neighboring plants on every sweep.
+
+| Debug rendering | Original FPS | Optimized FPS | Physics ticks/s | p95 frame time after the first 60 ticks |
+| --- | ---: | ---: | ---: | ---: |
+| On | 5.10 | 445.14 | 59.93 | 6.80 ms |
+| Off | 5.29 | 497.12 | 59.94 | 6.78 ms |
+
+Both runs completed 700 ticks and 5.318 m of capsule travel. Maximum simultaneous counts were seven rod contacts and eight face contacts. Peak capsule penetration was 28.87 mm with the penalty model.
+
+#### Ten-plant collision stress test
+
+Select **Stems → 10 plants**, or run **Tools / Foliage / Benchmark ten plants** in Play mode. The Windows build accepts `-benchmarkTenPlants`. Ten independently generated branch presets (seeds 17 through 26) share one solver. Trunk centers are 1.28 m apart within each of two staggered rows. Row separation is also 1.28 m. All ten roots are pinned. The current stand has 2,400 leaves. The measurements below describe the earlier 240-leaf stand.
+
+The generator applies its ordinary within-plant leaf clearance separately to each plant. Neighboring canopies enter the solver with their generated overlaps intact. **Between plants** counts active contact witnesses whose features belong to different plants. After one unloaded tick the fixture recorded 33 such witnesses and 9.83 mm maximum estimated inter-plant penetration. The benchmark resets the fixture, warms up under gravity for 60 physics ticks, then measures 12 wall-clock seconds each of gravity and continuous rod dragging. Both passes keep self-collision, DAT and 18 sweeps enabled.
+
+Measured at 1547 × 870 on a GeForce GTX 1070 Ti with the fixed 1.28 m spacing.
+
+| Runtime | Load | Average FPS | p95 frame time | Physics ticks/s | Peak between-plant witnesses | Peak estimated penetration |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Windows player | Gravity | 2.87 | 377.05 ms | 17.19 | 66 | 0.69 mm |
+| Windows player | Rod drag | 2.69 | 419.15 ms | 16.14 | 68 | 0.71 mm |
+| Unity Editor | Gravity | 1.97 | 576.77 ms | 11.84 | 64 | 0.68 mm |
+| Unity Editor | Rod drag | 1.53 | 768.46 ms | 9.18 | 63 | 0.69 mm |
+
+The optimized Windows player uses a Burst-compiled sweep over the horizontal axis to find overlapping swept feature bounds. It reuses the previous tick�s ordering and processes candidate pairs in larger parallel batches. The final build used the same fixture, safeguards, 18 sweeps and benchmark.
+
+| Load | Average FPS | p95 frame time | Physics ticks/s | Peak between-plant witnesses | Peak estimated penetration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gravity | 182.30 | 9.60 ms | 60.15 | 74 | 0.73 mm |
+| Rod drag | 185.70 | 9.29 ms | 60.04 | 64 | 0.75 mm |
+
+Contact counts include touching features. These aggregate measurements do not establish how long individual pairs stayed penetrated.
 
 ### Planned plant types
 

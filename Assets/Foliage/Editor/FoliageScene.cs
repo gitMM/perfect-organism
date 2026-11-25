@@ -38,6 +38,22 @@ public static class FoliageScene
         if(!EditorSceneManager.SaveScene(scene,Path)) throw new Exception("Could not save foliage scene");
     }
 
+    [MenuItem("Tools/Foliage/Benchmark ten plants")]
+    public static void BenchmarkTen()
+    {
+        var lab=UnityEngine.Object.FindFirstObjectByType<FoliageLab>();
+        if(!Application.isPlaying || !lab)throw new InvalidOperationException("Run the foliage lab first.");
+        lab.StartCoroutine(lab.BranchFrameBenchmark(tenPlants:true));
+    }
+
+    [MenuItem("Tools/Foliage/Benchmark branched plant")]
+    public static void BenchmarkBranch()
+    {
+        var lab=UnityEngine.Object.FindFirstObjectByType<FoliageLab>();
+        if(!Application.isPlaying || !lab)throw new InvalidOperationException("Run the foliage lab first.");
+        lab.StartCoroutine(lab.BranchFrameBenchmark());
+    }
+
     [MenuItem("Tools/Foliage/Check generated topology")]
     public static void CheckGeometry()
     {
@@ -48,7 +64,7 @@ public static class FoliageScene
             var s=PlantSettings.Default;
             s.seed=seed; s.resolution=resolution; s.leaves=leaves;
             var g=PlantGeometry.Generate(s);
-            if(g.issues.Count!=0 || g.joints.Count!=2*leaves)
+            if(g.issues.Count!=0 || g.bladeRows.Count!=10*leaves || g.joints.Count!=2*g.bladeRows.Count)
                 throw new Exception($"Topology failed for {seed}/{resolution}/{leaves}: {string.Join(", ",g.issues)}");
             foreach(var f in g.faces)
                 if(Vector3.Cross(g.nodes[f.b]-g.nodes[f.a],g.nodes[f.c]-g.nodes[f.a]).y<=0)

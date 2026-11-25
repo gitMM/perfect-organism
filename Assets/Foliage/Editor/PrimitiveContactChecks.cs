@@ -5,6 +5,39 @@ using UnityEngine;
 
 public static class PrimitiveContactChecks
 {
+    [MenuItem("Tools/Foliage/Check spawn overlaps")]
+    public static void CheckSpawnOverlaps()
+    {
+        if(!Application.isPlaying)throw new InvalidOperationException("Enter Play mode first.");
+        var g=PlantGeometry.Generate(PlantSettings.BranchTest);
+        using var s=new VbdSheet(plant:new RodPlant(g));
+        s.gravityScale=0;
+        s.Step(1f/60);
+        if(s.selfContact.bladeContacts!=0)throw new Exception("Leaves have active contact at rest.");
+        Vector3 embedded=s.Point(g.faces.Count/2,Vector3.one/3f);
+        foreach(var mode in new[]{ContactModel.Penalty,ContactModel.OGC})
+        foreach(var shape in new[]{ObstacleShape.Sphere,ObstacleShape.Capsule,ObstacleShape.Box,ObstacleShape.Gate})
+        {
+            var c=s.contact;c.model=mode;
+            var rotation=Quaternion.Euler(0,0,20);
+            // Put wall zero of the gate on the blade.
+            Vector3 center=shape==ObstacleShape.Gate?embedded-rotation*(Vector3.right*.18f):embedded;
+            c.Configure(shape,center,rotation,.15f);
+            s.QueryContacts();
+            bool intersect=false;
+            foreach(var hit in c.hits)intersect|=hit.clearance<0;
+            if(!intersect)throw new Exception($"Fixture missed {shape} in {mode}.");
+            s.Reset();
+            s.QueryContacts();
+            foreach(var hit in c.hits)
+                if(hit.clearance<0)throw new Exception($"Reset left {shape} embedded in {mode}.");
+            if(c.target!=c.center)throw new Exception("Stationary obstacle target still points into the plant.");
+            for(int i=0;i<5;i++)s.Step(1f/60);
+            if(c.physicalPenetration>.0001f || s.badVertex>=0)throw new Exception($"Unstable {shape} spawn in {mode}.");
+        }
+        Debug.Log("Spawn checks passed for unloaded blades and eight embedded obstacle configurations.");
+    }
+
     [MenuItem("Tools/Foliage/Check OGC regions")]
     public static void CheckRegions()
     {

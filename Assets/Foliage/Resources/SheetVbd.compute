@@ -1,23 +1,29 @@
 // Implicit Euler vertex block descent following Chen et al. (2024).
 // Spring and signed dihedral energy models follow Newton's particle VBD kernels.
+#pragma kernel PrepareFall
 #pragma kernel Predict
+#pragma kernel CacheRestMotion
 #pragma kernel Relax
+#pragma kernel RelaxPlant LOCAL_PLANT
+#pragma kernel RelaxCutPlant LOCAL_PLANT PACKED_PLANT
 #pragma kernel Measure
 #pragma kernel Finish
 #pragma kernel DetectContacts
 #pragma kernel Snapshot
+#pragma kernel DeformSkin
+#pragma kernel SkinNormals
 
 struct Element { int4 ids; float rest; float angle; float vein; float materialScale; int extra; int kind; float4 reference; };
 struct Sample { float3 position; float3 velocity; float3 force; float2 energy; float3 grabForce; };
 StructuredBuffer<Element> Elements;
-StructuredBuffer<int> Offsets, Incident, Groups;
+StructuredBuffer<int> Offsets, Incident, Groups, GroupNodes;
 StructuredBuffer<float> Mass;
 RWStructuredBuffer<float3> X, Old, Inertia, Velocity;
 #include "PrimitiveContact.hlsl"
 RWStructuredBuffer<Sample> Samples;
 RWStructuredBuffer<float> Residual;
 RWStructuredBuffer<float2> MotionStats;
-int Count, Group, Sweep, GrabEnabled, WarmStartVelocity, PhysicalNodes;
+int Count, GroupStart, Sweep, GrabEnabled, WarmStartVelocity, PhysicalNodes;
 int4 GrabIds;
 struct SelfRow { int4 ids; float4 weights; float3 normal; float distance; };
 StructuredBuffer<SelfRow> SelfRows;
@@ -39,7 +45,26 @@ float3x3 Outer(float3 v) { return float3x3(v.x*v,v.y*v,v.z*v); }
 StructuredBuffer<float4> DatPlanes;
 StructuredBuffer<int> DatOffsets;
 int UseDat;
-float DatTravel;
+float DatTravelBase,UniformTravel;
+int LocalTravel;
+#ifdef LOCAL_PLANT
+groupshared float3 localX[1536];
+groupshared int4 range;
+StructuredBuffer<int4> PlantRanges;
+StructuredBuffer<int> PlantOrder,PlantColors;
+int ColorCount;
+#ifdef PACKED_PLANT
+StructuredBuffer<int> LocalIndices,PackedNodes;
+int LocalIndex(int v){return LocalIndices[v];}
+int GlobalIndex(int i){return PackedNodes[range.x+i];}
+#else
+int LocalIndex(int v){return v<PhysicalNodes?v-range.x:range.y+v-range.z;}
+int GlobalIndex(int i){return i<range.y?range.x+i:range.z+i-range.y;}
+#endif
+float3 Position(int v){return localX[LocalIndex(v)];}
+#else
+float3 Position(int v){return X[v];}
+#endif
 float3 BoundMotion(int v,float3 delta)
 {
     if(UseOgc==0 && UseDat==0)return delta;
@@ -49,27 +74,37 @@ float3 BoundMotion(int v,float3 delta)
     {
         // Bounds are measured from this tick's detection positions, including
         // motion already consumed by prediction and earlier color sweeps.
-        float3 used=X[v]-Old[v];
+        float DatTravel=LocalTravel!=0?min(.15,DatTravelBase+Dt*length(Velocity[v])):UniformTravel;
+        float3 used=Position(v)-Old[v];
         delta=clamp(used+delta,-DatTravel,DatTravel)-used;
         radius=DatTravel;
         int begin=DatOffsets[v],end=DatOffsets[v+1];
+        bool projected=false;
         for(int i=begin;i<end;i++)
         {
             float4 p=DatPlanes[i];
             float slack=max(0,p.w-dot(p.xyz,used));
-            delta-=max(0,dot(p.xyz,delta)-slack)*p.xyz;
+            float excess=dot(p.xyz,delta)-slack;
+            if(excess>0)
+            {
+                delta-=excess*p.xyz;
+                projected=true;
+            }
             radius=min(radius,slack);
         }
         // Projection onto one plane can violate another. Clip the final
         // segment against every half-space and the broad-phase travel box.
-        delta=clamp(used+delta,-DatTravel,DatTravel)-used;
-        float t=1;
-        for(int j=begin;j<end;j++)
+        if(projected)
         {
-            float4 p=DatPlanes[j];float closing=dot(p.xyz,delta);
-            if(closing>0)t=min(t,max(0,p.w-dot(p.xyz,used))/closing);
+            delta=clamp(used+delta,-DatTravel,DatTravel)-used;
+            float t=1;
+            for(int j=begin;j<end;j++)
+            {
+                float4 p=DatPlanes[j];float closing=dot(p.xyz,delta);
+                if(closing>0)t=min(t,max(0,p.w-dot(p.xyz,used))/closing);
+            }
+            delta*=t;
         }
-        delta*=t;
     }
     if(UseOgc!=0)
     {
@@ -89,6 +124,33 @@ float3 BoundMotion(int v,float3 delta)
     return delta;
 }
 
+RWStructuredBuffer<float4> FallMotion;
+int HasFragments,PlayerOrbit;
+StructuredBuffer<int> RodCounts;
+
+// Each free vertex owns one third of each incident face's area. Integrate
+// pressure drag implicitly along the local normal so it can only remove speed.
+[numthreads(64,1,1)]
+void PrepareFall(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)Count || FallMotion[id].w==0)return;
+    float3 areaNormal=0;
+    for(int j=Offsets[id];j<Offsets[id+1];j++)
+    {
+        Element elem=Elements[Incident[j]];
+        int3 s=elem.ids.xyz;
+        if(elem.kind==4 && s.z>=0)
+            areaNormal+=cross(X[s.y]-X[s.x],X[s.z]-X[s.x])/6;
+    }
+    float3 velocity=Velocity[id]+Dt*Gravity*GravityScale;
+    float area=length(areaNormal);
+    float3 normal=areaNormal/max(area,1e-12);
+    float vn=dot(velocity,normal);
+    float resistance=.72*area*abs(vn)*Dt/max(Mass[id],1e-12);
+    velocity-=normal*vn*(resistance/(1+resistance));
+    FallMotion[id]=float4(velocity,1);
+}
+
 [numthreads(64,1,1)]
 void Predict(uint id:SV_DispatchThreadID)
 {
@@ -96,9 +158,17 @@ void Predict(uint id:SV_DispatchThreadID)
     if(UseOgc!=0 || UseDat!=0)MotionStats[id]=float2(1e20,0);
     Old[id]=X[id];
     float3 y=X[id]+Dt*Velocity[id]+Dt*Dt*Gravity*(id<(uint)PhysicalNodes?GravityScale:0);
+    bool free=false;
+    if(HasFragments!=0)
+    {
+        float4 fall=FallMotion[id];
+        free=fall.w!=0;
+        if(free)y=X[id]+Dt*fall.xyz;
+    }
     Inertia[id]=Groups[id]<0 ? X[id] : y;
     // Gravity stays in the objective; extrapolating velocity on blades speeds bending waves.
-    if(WarmStartVelocity!=0 && Groups[id]>=0) X[id]+=BoundMotion(id,Dt*Velocity[id]);
+    if(WarmStartVelocity!=0 && Groups[id]>=0 && (PlayerOrbit==0 || free || RodCounts[id]==0))
+        X[id]+=BoundMotion(id,free?(y-X[id])/(1+Dt*DragRate):Dt*Velocity[id]);
 }
 
 float Angle(float3 a,float3 b,float3 c,float3 d,out float3 ga,out float3 gb,out float3 gc)
@@ -112,12 +182,30 @@ float Angle(float3 a,float3 b,float3 c,float3 d,out float3 ga,out float3 gb,out 
     return atan2(dot(cross(n,m),e/len),dot(n,m));
 }
 
+// Old is fixed for all solver sweeps in this tick.
+RWStructuredBuffer<float> OldMeasure;
+int StructuralCount;
+[numthreads(64,1,1)]
+void CacheRestMotion(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)StructuralCount)return;
+    Element elem=Elements[id];
+    int4 s=elem.ids;
+    if(elem.kind>1)return;
+    if(s.z<0) OldMeasure[id]=length(Old[s.x]-Old[s.y]);
+    else
+    {
+        float3 a,b,c;
+        OldMeasure[id]=Angle(Old[s.x],Old[s.y],Old[s.z],Old[s.w],a,b,c);
+    }
+}
+
 float3x3 Skew(float3 a){return float3x3(0,-a.z,a.y,a.z,0,-a.x,-a.y,a.x,0);}
 struct Frame { float3 x,y,z; float3x3 spin; };
 Frame MaterialFrame(int a,int b,int g,int v)
 {
     Frame f;
-    float3 axis=X[b]-X[a], arm=X[g]-.5*(X[a]+X[b]);
+    float3 axis=Position(b)-Position(a), arm=Position(g)-.5*(Position(a)+Position(b));
     float len=max(length(axis),1e-8);
     f.z=axis/len;
     float axial=dot(arm,f.z);
@@ -144,7 +232,7 @@ void RodEnergy(Element e,int v,inout float3 force,inout float3x3 H,inout float2 
     if(e.kind==3)
     {
         float3 offset=World(parent,e.reference.xyz);
-        float3 err=X[s.w]-X[s.y]-offset;
+        float3 err=Position(s.w)-Position(s.y)-offset;
         float3x3 J=((v==s.w?1:0)-(v==s.y?1:0))*I+mul(Skew(offset),parent.spin);
         VectorEnergy(err,J,k,force,H);
         energy.x+=.125*k*dot(err,err);
@@ -166,7 +254,7 @@ void RodEnergy(Element e,int v,inout float3 force,inout float3x3 H,inout float2 
 }
 void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3 grab)
 {
-    float3 p=X[v];
+    float3 p=Position(v);
     float drag=Mass[v]*DragRate/Dt;
     force=-drag*(p-Old[v]); H=(Mass[v]/(Dt*Dt)+drag)*I; energy=0; grab=0;
     if(HasSelfContact!=0)
@@ -191,7 +279,8 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
     }
     for(int j=Offsets[v];j<Offsets[v+1];j++)
     {
-        Element elem=Elements[Incident[j]];
+        int index=Incident[j];
+        Element elem=Elements[index];
         if(elem.kind==4)
         {
             if(Shape==0)continue;
@@ -201,7 +290,7 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
                 if(hit.depth<=0)continue;
                 int3 ids=elem.ids.xyz;
                 float3 w=hit.weights;
-                float3 pos=w.x*X[ids.x]+w.y*X[ids.y]+w.z*X[max(ids.z,0)];
+                float3 pos=w.x*Position(ids.x)+w.y*Position(ids.y)+w.z*Position(ids.z>=0?ids.z:ids.y);
                 float remaining=hit.depth-dot(pos-hit.witness,hit.normal);
                 if(remaining<=0)continue;
                 float weight=v==ids.x?w.x:v==ids.y?w.y:w.z;
@@ -226,12 +315,22 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
         if(s.z<0)
         {
             int other=v==s.x?s.y:s.x;
-            float3 edge=p-X[other];
+            float3 edge=p-Position(other);
             float len=max(length(edge),1e-8);
             grad=edge/len;
             k=elem.kind==1?RodStiffness*elem.angle:Stretch*elem.materialScale*lerp(1,VeinRatio,elem.vein);
             delta=len-elem.rest;
-            change=len-length(Old[v]-Old[other]);
+            change=len-OldMeasure[index];
+            // Woody fibres resist elongation much more than bending. The extra
+            // tensile energy is zero in compression and below two percent strain.
+            if(elem.kind==1 && elem.materialScale>0 && delta>.02*elem.rest)
+            {
+                float excess=delta-.02*elem.rest;
+                float fibreK=100*k;
+                force-=fibreK*excess*grad;
+                H+=fibreK*(Outer(grad)+(excess/len)*(I-Outer(grad)));
+                energy.x+=.25*fibreK*excess*excess;
+            }
             // Keep the tensile geometric stiffness; project negative compression curvature to zero.
             H+=k*max(0,delta/len)*(I-Outer(grad));
             energy.x+=.25*k*delta*delta;
@@ -239,10 +338,9 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
         else
         {
             float3 a,b,c;
-            delta=Angle(X[s.x],X[s.y],X[s.z],X[s.w],a,b,c);
+            delta=Angle(Position(s.x),Position(s.y),Position(s.z),Position(s.w),a,b,c);
             grad=v==s.x?a:v==s.y?b:v==s.z?c:-a-b-c;
-            float oldAngle=Angle(Old[s.x],Old[s.y],Old[s.z],Old[s.w],a,b,c);
-            change=delta-oldAngle;
+            change=delta-OldMeasure[index];
             if(abs(change)>3.14159265) change-=sign(change)*6.2831853;
             delta-=elem.angle;
             if(abs(delta)>3.14159265) delta-=sign(delta)*6.2831853;
@@ -259,7 +357,7 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
         float3 attachment=0,oldPoint=0;
         [unroll] for(int i=0;i<3;i++)
         {
-            attachment+=Weights[i]*X[GrabIds[i]];
+            attachment+=Weights[i]*Position(GrabIds[i]);
             oldPoint+=Weights[i]*Old[GrabIds[i]];
         }
         float3 raw=GrabK*(Target-attachment)-GrabD*(attachment-oldPoint)/Dt;
@@ -270,16 +368,90 @@ void Evaluate(int v,out float3 force,out float3x3 H,out float2 energy,out float3
         H+=w*w*(GrabK+GrabD/Dt)*cap*(size>GrabLimit?I-Outer(raw/size):I);
     }
 }
-[numthreads(64,1,1)]
-void Relax(uint id:SV_DispatchThreadID)
+// Normalize before taking cofactors. A nearly collapsed rod frame can
+// otherwise overflow the determinant or lose the weak bending direction.
+float3 NewtonStep(float3x3 H,float3 force)
 {
-    if(id>=(uint)Count || Groups[id]!=Group) return;
+    float scale=max(max(H[0][0],H[1][1]),max(H[2][2],1e-12));
+    H=H/scale+.0005*I;
+    force/=scale;
+    float3 a=cross(H[1],H[2]),b=cross(H[2],H[0]),c=cross(H[0],H[1]);
+    return float3(dot(a,force),dot(b,force),dot(c,force))/max(dot(H[0],a),1e-12);
+}
+// Line-search each colored update against the rod's maximum tensile length.
+// Scaling the already contact-safe step also preserves every contact half-space.
+float3 RodStep(int v,float3 move)
+{
+    if(PlayerOrbit==0 || RodCounts[v]==0)return BoundMotion(v,move);
+    int start=Offsets[v];
+    // Keep the tangential component: a taut shoot can slide around the
+    // capsule even when the proposed outward displacement is inadmissible.
+    for(int i=0;i<RodCounts[v];i++)
+    {
+        Element rod=Elements[Incident[start+i]];
+        int other=rod.ids.x==v?rod.ids.y:rod.ids.x;
+        float3 edge=Position(v)-Position(other);
+        float3 next=edge+move;
+        float cap=1.05*rod.rest;
+        if(dot(next,next)>cap*cap)move=next*(cap*rsqrt(dot(next,next)))-edge;
+    }
+    move=BoundMotion(v,move);
+    float t=1, step2=dot(move,move);
+    for(int j=0;j<RodCounts[v];j++)
+    {
+        Element rod=Elements[Incident[start+j]];
+        int other=rod.ids.x==v?rod.ids.y:rod.ids.x;
+        float3 edge=Position(v)-Position(other);
+        float cap=1.05*rod.rest;
+        float slack=max(0,cap*cap-dot(edge,edge));
+        float along=dot(edge,move);
+        if(step2+2*along<=slack)continue;
+        t=min(t,(sqrt(max(0,along*along+step2*slack))-along)/max(step2,1e-20));
+    }
+    return t*move;
+}
+[numthreads(64,1,1)]
+void Relax(uint thread:SV_DispatchThreadID)
+{
+    int id=GroupNodes[GroupStart+thread];
+    if(id<0)return;
     float3 f,g; float2 energy; float3x3 H;
     Evaluate(id,f,H,energy,g);
     f+=Mass[id]*(Inertia[id]-X[id])/(Dt*Dt);
-    float3 a=cross(H[1],H[2]), b=cross(H[2],H[0]), c=cross(H[0],H[1]);
-    X[id]+=BoundMotion(id,float3(dot(a,f),dot(b,f),dot(c,f))/max(dot(H[0],a),1e-20));
+    X[id]+=RodStep(id,NewtonStep(H,f));
 }
+#ifdef LOCAL_PLANT
+[numthreads(128,1,1)]
+#ifdef PACKED_PLANT
+void RelaxCutPlant(uint plant:SV_GroupID,uint lane:SV_GroupIndex)
+#else
+void RelaxPlant(uint plant:SV_GroupID,uint lane:SV_GroupIndex)
+#endif
+{
+    if(lane==0)range=PlantRanges[plant];
+    GroupMemoryBarrierWithGroupSync();
+    int count=range.y+range.w;
+    for(int local=lane;local<count;local+=128)
+        localX[local]=X[GlobalIndex(local)];
+    GroupMemoryBarrierWithGroupSync();
+    int base=plant*(ColorCount+1);
+    for(int color=0;color<ColorCount;color++)
+    {
+        int begin=PlantColors[base+color],end=PlantColors[base+color+1];
+        for(int idx=begin+lane;idx<end;idx+=128)
+        {
+            int v=PlantOrder[idx];
+            float3 f,g;float2 energy;float3x3 H;
+            Evaluate(v,f,H,energy,g);
+            f+=Mass[v]*(Inertia[v]-Position(v))/(Dt*Dt);
+            localX[LocalIndex(v)]+=RodStep(v,NewtonStep(H,f));
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    for(int outNode=lane;outNode<count;outNode+=128)
+        X[GlobalIndex(outNode)]=localX[outNode];
+}
+#endif
 [numthreads(64,1,1)]
 void Measure(uint id:SV_DispatchThreadID)
 {
@@ -297,4 +469,50 @@ void Measure(uint id:SV_DispatchThreadID)
 void Finish(uint id:SV_DispatchThreadID)
 {
     if(id<(uint)Count) Velocity[id]=(X[id]-Old[id])/Dt;
+}
+
+RWByteAddressBuffer SkinVertices;
+StructuredBuffer<int2> SkinNodes;
+StructuredBuffer<int3> RenderRods;
+StructuredBuffer<float3> SkinOffsets,SkinRestNormals;
+StructuredBuffer<int> ShellVertices;
+int ShellVertexCount;
+StructuredBuffer<int> NormalOffsets;
+StructuredBuffer<int2> NormalEdges;
+int SkinCount,SkinStride,PositionOffset,NormalOffset;
+[numthreads(64,1,1)]
+void DeformSkin(uint id:SV_DispatchThreadID)
+{
+    if(id>=(uint)SkinCount)return;
+    int2 bind=SkinNodes[id];
+    float3 p=X[bind.x];
+    if(bind.y>=0)
+    {
+        int3 rod=RenderRods[bind.y];
+        float3 a=X[rod.x],b=X[rod.y],axis=b-a;
+        float3 z=dot(axis,axis)>1e-16?normalize(axis):float3(0,1,0);
+        float3 up=cross(z,X[rod.z]-.5*(a+b));
+        if(dot(up,up)<1e-16)up=cross(z,abs(z.x)<.9?float3(1,0,0):float3(0,0,1));
+        float3 y=normalize(up),x=cross(y,z);
+        float3 local=SkinOffsets[id];
+        p+=local.x*x+local.y*y+local.z*z;
+        float3 n=SkinRestNormals[id];
+        SkinVertices.Store3(id*SkinStride+NormalOffset,asuint(n.x*x+n.y*y+n.z*z));
+    }
+    SkinVertices.Store3(id*SkinStride+PositionOffset,asuint(p));
+}
+[numthreads(64,1,1)]
+void SkinNormals(uint thread:SV_DispatchThreadID)
+{
+    if(thread>=(uint)ShellVertexCount)return;
+    uint id=ShellVertices[thread];
+    float3 p=asfloat(SkinVertices.Load3(id*SkinStride+PositionOffset)),n=0;
+    for(int i=NormalOffsets[thread];i<NormalOffsets[thread+1];i++)
+    {
+        int2 e=NormalEdges[i];
+        float3 a=asfloat(SkinVertices.Load3(e.x*SkinStride+PositionOffset));
+        float3 b=asfloat(SkinVertices.Load3(e.y*SkinStride+PositionOffset));
+        n+=cross(a-p,b-p);
+    }
+    SkinVertices.Store3(id*SkinStride+NormalOffset,asuint(n*rsqrt(max(dot(n,n),1e-25))));
 }

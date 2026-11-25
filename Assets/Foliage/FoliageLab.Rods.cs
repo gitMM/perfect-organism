@@ -9,12 +9,32 @@ namespace Foliage
         bool centers=true, directors, collarErrors;
         static readonly string[] rodMaps={"Plain","Bending","Twisting","Stretch"};
         PlantSettings previousPlant;
-        public void SetBranchTest(bool enable)
+        int previousVSync;
+        bool branchFramePacing;
+        bool adaptiveField=true;
+        void UpdateBranchFramePacing()
         {
-            if(settings.forked==enable)return;
-            if(enable)previousPlant=settings;
+            bool active=Sheet?.plant!=null && settings.forked;
+            if(active==branchFramePacing)return;
+            if(active)
+            {
+                previousVSync=QualitySettings.vSyncCount;
+                QualitySettings.vSyncCount=0;
+            }
+            else QualitySettings.vSyncCount=previousVSync;
+            branchFramePacing=active;
+        }
+        public void SetBranchTest(bool enable,bool tenPlants=false)
+            =>SetBranchPreset(enable,tenPlants?10:1);
+        void SetBranchPreset(bool enable,int count)
+        {
+            if(settings.forked==enable && settings.PlantCount==count)return;
+            if(enable && !settings.forked)previousPlant=settings;
             RestoreGeometry();
             settings=enable?PlantSettings.BranchTest:previousPlant.height>0?previousPlant:PlantSettings.Default;
+            settings.tenPlants=enable && count==10;
+            settings.plantCount=count;
+            settings.adaptivePhysics=count>1 && adaptiveField;
             seedText=settings.seed.ToString();
             Geometry=PlantGeometry.Generate(settings);
             OpenStems();
@@ -22,6 +42,7 @@ namespace Foliage
         public void OpenStems()
         {
             RestoreGeometry();
+            if(settings.adaptivePhysics && Geometry.coarsePlants==0)Geometry=PlantGeometry.Generate(settings);
             SetSurface(new VbdSheet(plant:new RodPlant(Geometry)));
             yaw=-22; pitch=14; Frame();
         }
@@ -30,16 +51,17 @@ namespace Foliage
             EndDrag(); inspectedFace=inspectedRod=-1;
             var plant=Sheet.plant;
             float nearest=limit;
-            Vector3 point=default;
-            foreach(var f in Geometry.surface)
+            int triangle=plant.PickSurface(ray,Sheet.positions,ref nearest,out var weights);
+            if(triangle<0)return false;
+            Vector3 point;
             {
-                if(!Intersect(ray,plant.skin[f.a],plant.skin[f.b],plant.skin[f.c],out float t,out Vector3 weights) || t>=nearest) continue;
-                nearest=t; inspectedFace=f.face; inspectedRod=f.rod;
+                var f=Geometry.surface[triangle];
+                inspectedFace=f.face;inspectedRod=f.rod;
                 if(f.rod>=0)
                 {
                     var rod=Geometry.rods[f.rod];
                     Vector3 a=Sheet.positions[rod.a], axis=Sheet.positions[rod.b]-a;
-                    rodFraction=Mathf.Clamp01(Vector3.Dot(ray.GetPoint(t)-a,axis)/Mathf.Max(axis.sqrMagnitude,1e-12f));
+                    rodFraction=Mathf.Clamp01(Vector3.Dot(ray.GetPoint(nearest)-a,axis)/Mathf.Max(axis.sqrMagnitude,1e-12f));
                     weights=new Vector3(1-rodFraction,rodFraction,0);
                     point=a+axis*rodFraction;
                 }
@@ -72,18 +94,24 @@ namespace Foliage
             plant.Strain(inspectedRod,Sheet.positions,out float strain,out float bend,out float twist);
             GUILayout.Label($"{PlantGeometry.Part(Geometry.rods[inspectedRod].part)} · rod {inspectedRod}\nStretch {strain:P2}    Bend {bend:F1}°\nTwist {twist:F1}°    Pick t {rodFraction:F2}");
         }
-        void DrawRodOverlay()
+        void DrawRodOverlay(bool batched)
         {
             var plant=Sheet.plant;
+            if(directors || rodMap!=0 || (centers && !batched))
             for(int i=0;i<Geometry.rods.Count;i++)
             {
                 var rod=Geometry.rods[i];
                 Vector3 a=Sheet.positions[rod.a],b=Sheet.positions[rod.b],center=(a+b)*.5f;
-                if(centers || rodMap!=0)
+                if((centers && !batched) || rodMap!=0)
                 {
-                    plant.Strain(i,Sheet.positions,out float stretch,out float bend,out float twist);
-                    float value=rodMap==1?bend/30:rodMap==2?Mathf.Abs(twist)/30:Mathf.Abs(stretch)/.05f;
-                    GL.Color(rodMap==0?Color.cyan:Color.Lerp(Color.blue,Color.red,Mathf.Clamp01(value))); Line(a,b);
+                    Color color=Color.cyan;
+                    if(rodMap!=0)
+                    {
+                        plant.Strain(i,Sheet.positions,out float stretch,out float bend,out float twist);
+                        float value=rodMap==1?bend/30:rodMap==2?Mathf.Abs(twist)/30:Mathf.Abs(stretch)/.05f;
+                        color=Color.Lerp(Color.blue,Color.red,Mathf.Clamp01(value));
+                    }
+                    GL.Color(color); Line(a,b);
                 }
                 if(directors)
                 {
