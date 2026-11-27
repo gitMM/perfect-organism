@@ -8,6 +8,7 @@ namespace Foliage
     {
         public int seed=2;
         public FigSettings settings=new();
+        public InteractiveFigLayout bakedLayout;
         [Tooltip("Use the surface under the trunk when a ground collider is present. Otherwise use the generator slope.")]
         public bool sampleGround=true;
         public LayerMask groundLayers=Physics.DefaultRaycastLayers;
@@ -34,6 +35,7 @@ namespace Foliage
         GameObject generated;
         Material leafMaterial;
         Mesh wood;
+        bool ownsWood;
         MeshCollider trunk;
         FigBranchInstance grabbed;
         float depth;
@@ -52,7 +54,13 @@ namespace Foliage
             return settings.GroundGradient;
         }
         void OnEnable(){
-            wood=FigBranchInstance.BuildTree(seed,settings,crown,GroundGradient());
+            var gradient=GroundGradient();
+            ownsWood=!bakedLayout || !bakedLayout.Matches(seed,settings,gradient);
+            if(ownsWood)wood=FigBranchInstance.BuildTree(seed,settings,crown,gradient);
+            else{
+                wood=bakedLayout.wood;
+                bakedLayout.BuildBranches(crown);
+            }
             generated=new GameObject("Fig wood");
             generated.transform.SetParent(transform,false);
             generated.AddComponent<MeshFilter>().sharedMesh=wood;
@@ -73,7 +81,8 @@ namespace Foliage
             if(generated){generated.SetActive(false);Destroy(generated);}
             foreach(var b in crown){b.Sleep();Destroy(b.mesh);}
             crown.Clear();boughRenderers.Clear();debugVisible=false;elapsed=0;
-            if(wood)Destroy(wood);
+            if(ownsWood && wood)Destroy(wood);
+            wood=null;
             if(leafMaterial)Destroy(leafMaterial);
         }
         void Release(){

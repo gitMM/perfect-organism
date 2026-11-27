@@ -46,10 +46,19 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::Foliage.InteractiveJungleFig
   seed: 2
   settings:
+    sizeClass: 0
+    slopeDegrees: 0
+    uphillHeading: 0
     size: 1
     crownSpread: 1
     buttressReach: 1
     fusion: 0.45
+    canopyDensity: 4
     propFrequency: 0.35
+  bakedLayout: {fileID: 1085065214571716103, guid: 0b6628a9edf5ffa48a8786a04c03de84, type: 3}
+  sampleGround: 1
+  groundLayers:
+    serializedVersion: 2
+    m_Bits: 4294967291
   bark: {fileID: 2100000, guid: 2581f7cf31b86764794a138ece01663a, type: 2}
   interactionCamera: {fileID: 0}

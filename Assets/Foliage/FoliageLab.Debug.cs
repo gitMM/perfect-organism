@@ -46,7 +46,7 @@ namespace Foliage
             GUILayout.Label("<b>FOLIAGE  /  TEST SCENE</b>");
             if(stressGrove){
                 GUILayout.Label("20-tree collision stress test");
-                GUILayout.Label($"Trees generated   {stressGrove.Trees} / {FigStressGrove.Count}");
+                GUILayout.Label($"Trees   {stressGrove.Trees}");
                 GUILayout.Label($"Physics tick   {stressGrove.Tick}\nTrees in contact   {stressGrove.TreesInContact}\nContacting tree pairs   {stressGrove.ContactPairs}");
                 if(GUILayout.Button(stressGrove.Paused?"Resume physics":"Pause physics"))stressGrove.Paused=!stressGrove.Paused;
                 if(GUILayout.Button("Single step")){stressGrove.Paused=true;stressGrove.Step();}
@@ -67,7 +67,7 @@ namespace Foliage
                 GUILayout.EndArea();GUI.matrix=Matrix4x4.identity;return;
             }
             if(jungleFigPrefab && GUILayout.Button("Jungle fig")){OpenJungleFig();GUIUtility.ExitGUI();}
-            if(jungleFigPrefab && GUILayout.Button("20-tree collision stress test")){OpenTreeStressTest();GUIUtility.ExitGUI();}
+            if(jungleFigPrefab && groveLayout && GUILayout.Button("20-tree collision stress test")){OpenTreeStressTest();GUIUtility.ExitGUI();}
             int current=Sheet==null?0:Sheet.plant!=null?3:Sheet.leaf==null?1:2;
             int workspace=GUILayout.Toolbar(current,new[]{"Plant","Sheet","Leaf","Stems"});
             if(workspace!=current)

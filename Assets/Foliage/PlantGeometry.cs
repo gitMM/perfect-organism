@@ -46,12 +46,12 @@ namespace Foliage
     // Rods and shell faces index the same nodes. A leaf base is its stalk's end node.
     public sealed class PlantGeometry
     {
-        public struct Rod { public int a, b, part; public float radius,collisionRadius,woodRigidityGain; }
-        public struct Face { public int a, b, c, part; }
-        public struct SkinFace { public int a, b, c, rod, face; }
+        [Serializable] public struct Rod { public int a, b, part; public float radius,collisionRadius,woodRigidityGain; }
+        [Serializable] public struct Face { public int a, b, c, part; }
+        [Serializable] public struct SkinFace { public int a, b, c, rod, face; }
         public readonly List<Vector3> nodes = new();
         // A generated spray owns contiguous particles and rods. Its attachment stays on the skeleton.
-        internal struct TwigCluster
+        [Serializable] internal struct TwigCluster
         {
             public int anchor,firstNode,endNode,firstRod,endRod;
         }

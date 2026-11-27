@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace Foliage
 {
-    public sealed class FigShoot
+    public sealed partial class FigShoot
     {
         public readonly PlantGeometry geometry=new();
         public readonly Vector3 origin;
@@ -330,13 +330,14 @@ namespace Foliage
     }
     public sealed class FigBranchInstance
         {
-            const float MouseGrabForceScale=10f;
+            const float MouseGrabForceScale=1000f;
             public FigShoot shoot;
             public Mesh mesh;
             public RodPlant rig;
             public VbdSheet solver;
             public Vector3 Center=>shoot.origin+mesh.bounds.center;
             public FigBranchInstance(FigShoot shoot){this.shoot=shoot;mesh=shoot.CreateMesh();}
+            internal FigBranchInstance(FigShoot shoot,Mesh template){this.shoot=shoot;mesh=UnityEngine.Object.Instantiate(template);}
             FigBranchInstance(FigShoot shoot,FigShoot.MeshData data){this.shoot=shoot;mesh=shoot.CreateMesh(data,true);}
             public static Mesh BuildTree(int seed,FigSettings settings,List<FigBranchInstance> branches,
                 Vector3? groundGradient=null,bool validate=false){
@@ -347,12 +348,7 @@ namespace Foliage
                         shoot.geometry.Validate();
                         if(shoot.geometry.issues.Count>0)throw new InvalidOperationException(string.Join(", ",shoot.geometry.issues));
                     }
-                    var rig=new RodPlant(shoot.geometry,null,null,trackCutNeighbors:false);
-                    // The interactive fig uses surface picking and grab constraints. Obstacle
-                    // and self contact belong to the collision demos' separate solvers.
-                    var solver=new VbdSheet(null,rig,true,obstacleContacts:false);
-                    solver.PrepareShellNormals();
-                    prepared[i]=(new FigShoot.MeshData(shoot),solver);
+                    prepared[i]=(new FigShoot.MeshData(shoot),PrepareSolver(shoot));
                 },groundGradient);
                 for(int i=0;i<shoots.Count;i++){
                     prepared.TryRemove(i,out var data);
@@ -362,6 +358,12 @@ namespace Foliage
                     branch.EnableRuntimeSkin();
                 }
                 return wood;
+            }
+            internal static VbdSheet PrepareSolver(FigShoot shoot,FigSolverLayout baked=null){
+                var rig=new RodPlant(shoot.geometry,null,null,trackCutNeighbors:false);
+                var solver=new VbdSheet(null,rig,true,obstacleContacts:false,baked:baked);
+                solver.PrepareShellNormals();
+                return solver;
             }
             public void Activate(){
                 if(solver!=null)return;

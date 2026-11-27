@@ -30,6 +30,7 @@ namespace Foliage
         public PlantSettings settings = PlantSettings.Default;
         public Camera view;
         public InteractiveJungleFig jungleFigPrefab;
+        public FigGroveLayout groveLayout;
         InteractiveJungleFig jungleFig;
         FigStressGrove stressGrove;
         bool TreeView=>jungleFig || stressGrove;
@@ -48,13 +49,13 @@ namespace Foliage
         }
 
         public void OpenTreeStressTest(){
-            if(TreeView || !jungleFigPrefab)return;
+            if(TreeView || !jungleFigPrefab || !groveLayout)return;
             EnterTreeView();
             var root=new GameObject("20-tree collision stress test");
             root.transform.position=transform.position;
             stressGrove=root.AddComponent<FigStressGrove>();
-            stressGrove.Initialize(jungleFigPrefab.bark);
-            FrameBounds(new Bounds(transform.position+Vector3.up*12,new Vector3(58,32,58)));
+            stressGrove.Initialize(groveLayout,jungleFigPrefab.bark);
+            FrameBounds(stressGrove.TreeBounds);
         }
 
         void EnterTreeView(){

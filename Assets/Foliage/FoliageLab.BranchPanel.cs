@@ -127,7 +127,7 @@ namespace Foliage
             Control(modes,"Leaf",()=>OpenLeaf(leafIndex));
             Control(modes,"Stems",()=>{},true);
             if(jungleFigPrefab)Control(Row(),"Jungle fig",OpenJungleFig);
-            if(jungleFigPrefab)Control(Row(),"20-tree collision stress test",OpenTreeStressTest);
+            if(jungleFigPrefab && groveLayout)Control(Row(),"20-tree collision stress test",OpenTreeStressTest);
             debugButton=Control(Row(),"Debug rendering",()=>SetDebugRendering(!debugRendering),debugRendering);
             Control(Row(),TenCapsuleTest,()=>OpenCapsulePreset(10));
             hundredPreset=Control(Row(),HundredCapsuleTest,()=>OpenCapsulePreset(100));

@@ -9,7 +9,7 @@ using UnityEngine;
 namespace Foliage
 {
     // Matches the Elements buffer in SheetVbd.compute.
-    internal struct VbdElement
+    [Serializable] internal struct VbdElement
     {
         public int a,b,c,d;
         public float rest,angle,vein,materialScale;

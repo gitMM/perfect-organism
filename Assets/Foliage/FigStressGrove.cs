@@ -15,109 +15,93 @@ namespace Foliage
         public Bounds TreeBounds {get; private set;}
         readonly HashSet<int> pairs=new();
         readonly HashSet<int> touched=new();
-        readonly List<Mesh> meshes=new();
-        Material bark,leaf;
+        Material leaf;
         Scene scene;
         PhysicsScene physicsScene;
 
-        public void Initialize(Material barkMaterial){
-            bark=barkMaterial;
+        public void Initialize(FigGroveLayout layout,Material bark){
             leaf=new Material(Resources.Load<Shader>("FigLeaf"));
+            var woodMaterials=new[]{bark};
+            var boughMaterials=new[]{bark,leaf};
             scene=SceneManager.CreateScene("Fig stress grove "+GetInstanceID(),new CreateSceneParameters(LocalPhysicsMode.Physics3D));
             SceneManager.MoveGameObjectToScene(gameObject,scene);
             physicsScene=scene.GetPhysicsScene();
-        }
-
-        // Five trees per patch. Spacing scales with crown size so the saplings
-        // meet other saplings below the two taller canopy layers.
-        void Update(){
-            if(Trees>=Count)return;
-            int index=Trees, patch=index/5, slot=index%5;
-            var size=patch==0?FigSize.Small:patch==3?FigSize.Large:FigSize.Medium;
-            var settings=new FigSettings{sizeClass=size,size=.76f+.105f*slot+.024f*patch,canopyDensity=1};
-            int seed=23+17*index;
-            float spread=size==FigSize.Small?1f:size==FigSize.Medium?5f:10f;
-            Vector3 center=new Vector3(patch%2==0?-10:10,0,patch<2?-10:10);
-            float angle=slot*2.4f+patch;
-            Vector3 offset=new Vector3(Mathf.Cos(angle),0,Mathf.Sin(angle))*spread*Mathf.Sqrt(slot/4f);
-            var tree=new GameObject(size+" fig "+seed);
-            tree.transform.SetParent(transform,false);
-            tree.transform.localPosition=center+offset;
-            tree.transform.localRotation=Quaternion.Euler(0,index*137.5f,0);
-            var shoots=new List<FigShoot>();
-            var wood=JungleFig.Generate(seed,settings,shoots);
-            AddMesh(tree,wood,new[]{bark});
-            tree.layer=8+index;
-            var anchor=tree.AddComponent<Rigidbody>();
-            anchor.isKinematic=true;
-            anchor.excludeLayers=1<<tree.layer;
-            var trunk=tree.AddComponent<MeshCollider>();
-            trunk.sharedMesh=wood;
-            foreach(var shoot in shoots)AddBough(anchor,shoot,settings.ScaleFor(seed));
-            Trees++;
-        }
-
-        void AddMesh(GameObject obj,Mesh mesh,Material[] materials){
-            meshes.Add(mesh);
-            obj.AddComponent<MeshFilter>().sharedMesh=mesh;
-            var renderer=obj.AddComponent<MeshRenderer>();
-            renderer.sharedMaterials=materials;
-            var bounds=meshes.Count==1?renderer.bounds:TreeBounds;
-            bounds.Encapsulate(renderer.bounds);
+            // Register each compound body with PhysX once, after all its shapes exist.
+            gameObject.SetActive(false);
+            var drives=new List<(ConfigurableJoint joint,Rigidbody body,float rigidity)>();
+            foreach(var model in layout.trees){
+                var tree=new GameObject(model.name);
+                tree.transform.SetParent(transform,false);
+                tree.transform.SetLocalPositionAndRotation(model.position,model.rotation);
+                tree.layer=8+Trees;
+                AddMesh(tree,model.wood,woodMaterials);
+                var anchor=tree.AddComponent<Rigidbody>();
+                anchor.isKinematic=true;
+                anchor.excludeLayers=1<<tree.layer;
+                tree.AddComponent<MeshCollider>().sharedMesh=model.wood;
+                foreach(var bough in model.boughs){
+                    var joint=AddBough(anchor,bough,model.mass,boughMaterials,out var body);
+                    drives.Add((joint,body,bough.rigidity));
+                }
+                Trees++;
+            }
+            gameObject.SetActive(true);
+            // Unity computes compound inertia when the complete body enters its physics scene.
+            foreach(var drive in drives){
+                float inertia=drive.body.inertiaTensor.magnitude;
+                drive.joint.slerpDrive=new JointDrive{positionSpring=18*inertia*drive.rigidity,
+                    positionDamper=4*inertia*Mathf.Sqrt(drive.rigidity),maximumForce=float.MaxValue};
+            }
+            var renderers=GetComponentsInChildren<MeshRenderer>();
+            var bounds=renderers[0].bounds;
+            foreach(var renderer in renderers)bounds.Encapsulate(renderer.bounds);
             TreeBounds=bounds;
         }
 
-        void AddBough(Rigidbody anchor,FigShoot shoot,float scale){
+        static void AddMesh(GameObject obj,Mesh mesh,Material[] materials){
+            obj.AddComponent<MeshFilter>().sharedMesh=mesh;
+            obj.AddComponent<MeshRenderer>().sharedMaterials=materials;
+        }
+
+        ConfigurableJoint AddBough(Rigidbody anchor,FigGroveLayout.Bough model,float mass,Material[] materials,out Rigidbody body){
             var tree=anchor.gameObject;
             var obj=new GameObject("Jointed bough");
             obj.transform.SetParent(tree.transform,false);
-            obj.transform.localPosition=shoot.origin;
+            obj.transform.localPosition=model.origin;
             obj.layer=tree.layer;
-            AddMesh(obj,shoot.CreateMesh(),new[]{bark,leaf});
-            var geometry=shoot.geometry;
-            int endRod=geometry.twigClusters.Count==0?geometry.rods.Count:geometry.twigClusters[0].firstRod;
-            // Short capsule chains follow the wood. Leaf sprays move with their bough.
-            for(int i=1;i<endRod;){
-                var first=geometry.rods[i++];
-                var last=first;
-                for(int span=1;span<3 && i<endRod && geometry.rods[i].a==last.b;span++)
-                    last=geometry.rods[i++];
-                if(first.radius<.035f*scale)continue;
-                Vector3 a=geometry.nodes[first.a],b=geometry.nodes[last.b];
+            AddMesh(obj,model.mesh,materials);
+            body=obj.AddComponent<Rigidbody>();
+            foreach(var shape in model.capsules){
                 var colliderObject=new GameObject("Wood capsule");
                 colliderObject.layer=tree.layer;
-                var t=colliderObject.transform;
-                t.SetParent(obj.transform,false);
-                t.localPosition=(a+b)*.5f;
-                t.localRotation=Quaternion.FromToRotation(Vector3.up,b-a);
+                colliderObject.transform.SetParent(obj.transform,false);
+                colliderObject.transform.SetLocalPositionAndRotation(shape.center,shape.rotation);
                 var capsule=colliderObject.AddComponent<CapsuleCollider>();
-                capsule.radius=(first.radius+last.radius)*.5f;
-                capsule.height=(b-a).magnitude+2*capsule.radius;
+                capsule.radius=shape.radius;
+                capsule.height=shape.height;
             }
-            var body=obj.AddComponent<Rigidbody>();
             body.useGravity=false;
             body.excludeLayers=1<<tree.layer;
-            body.mass=Mathf.Clamp(80*scale*scale*scale,1,180);
+            body.mass=mass;
             body.angularDamping=2;
             body.maxDepenetrationVelocity=2;
             var joint=obj.AddComponent<ConfigurableJoint>();
             joint.autoConfigureConnectedAnchor=false;
             joint.connectedBody=anchor;
             joint.anchor=Vector3.zero;
-            joint.connectedAnchor=shoot.origin;
+            joint.connectedAnchor=model.origin;
             joint.projectionMode=JointProjectionMode.PositionAndRotation;
             joint.projectionDistance=.015f;
             joint.projectionAngle=2;
             joint.xMotion=joint.yMotion=joint.zMotion=ConfigurableJointMotion.Locked;
             joint.angularXMotion=joint.angularYMotion=joint.angularZMotion=ConfigurableJointMotion.Limited;
-            float rigidity=1+FigShoot.WoodRigidityGain(geometry.rods[0].radius/scale);
+            float rigidity=model.rigidity;
             float limit=22f/Mathf.Sqrt(rigidity);
             joint.lowAngularXLimit=new SoftJointLimit{limit=-limit};
             joint.highAngularXLimit=joint.angularYLimit=joint.angularZLimit=new SoftJointLimit{limit=limit};
             joint.rotationDriveMode=RotationDriveMode.Slerp;
-            float inertia=body.inertiaTensor.magnitude;
-            joint.slerpDrive=new JointDrive{positionSpring=18*inertia*rigidity,positionDamper=4*inertia*Mathf.Sqrt(rigidity),maximumForce=float.MaxValue};
             obj.AddComponent<FigStressBough>().grove=this;
+            return joint;
         }
 
         public void Step(){
@@ -133,7 +117,7 @@ namespace Foliage
             touched.Add(a);touched.Add(b);
         }
         void OnDestroy(){
-            foreach(var mesh in meshes)Destroy(mesh);
+
             if(leaf)Destroy(leaf);
         }
         public void Close(){
