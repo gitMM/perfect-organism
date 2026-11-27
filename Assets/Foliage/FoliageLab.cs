@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -31,25 +31,42 @@ namespace Foliage
         public Camera view;
         public InteractiveJungleFig jungleFigPrefab;
         InteractiveJungleFig jungleFig;
-        bool restoreSphere;
+        FigStressGrove stressGrove;
+        bool TreeView=>jungleFig || stressGrove;
+        bool restoreSphere,restoreObstacle;
         Vector3 previousPivot;
         float previousDistance;
 
         public void OpenJungleFig()
         {
-            if(jungleFig || !jungleFigPrefab)return;
+            if(TreeView || !jungleFigPrefab)return;
+            EnterTreeView();
+            jungleFig=Instantiate(jungleFigPrefab,transform.position,Quaternion.identity);
+            jungleFig.interactionCamera=view;
+            jungleFig.labClock=true;
+            FrameFig();
+        }
+
+        public void OpenTreeStressTest(){
+            if(TreeView || !jungleFigPrefab)return;
+            EnterTreeView();
+            var root=new GameObject("20-tree collision stress test");
+            root.transform.position=transform.position;
+            stressGrove=root.AddComponent<FigStressGrove>();
+            stressGrove.Initialize(jungleFigPrefab.bark);
+            FrameBounds(new Bounds(transform.position+Vector3.up*12,new Vector3(58,32,58)));
+        }
+
+        void EnterTreeView(){
             FinishQueuedTick();
             EndDrag();
             CancelCut();
             previousPivot=pivot; previousDistance=distance;
             restoreSphere=testSphere.gameObject.activeSelf;
             testSphere.gameObject.SetActive(false);
+            restoreObstacle=obstacleObject && obstacleObject.activeSelf;
             if(obstacleObject)obstacleObject.SetActive(false);
             GetComponent<MeshRenderer>().enabled=false;
-            jungleFig=Instantiate(jungleFigPrefab,transform.position,Quaternion.identity);
-            jungleFig.interactionCamera=view;
-            jungleFig.labClock=true;
-            FrameFig();
         }
 
         void FrameFig()
@@ -57,6 +74,9 @@ namespace Foliage
             var renderers=jungleFig.GetComponentsInChildren<MeshRenderer>();
             var bounds=renderers[0].bounds;
             foreach(var r in renderers)bounds.Encapsulate(r.bounds);
+            FrameBounds(bounds);
+        }
+        void FrameBounds(Bounds bounds){
             pivot=bounds.center;
             PlaceCamera();
             float halfAngle=view.fieldOfView*.5f*Mathf.Deg2Rad;
@@ -67,13 +87,16 @@ namespace Foliage
 
         public void CloseJungleFig()
         {
-            if(!jungleFig)return;
-            jungleFig.gameObject.SetActive(false);
-            Destroy(jungleFig.gameObject);
-            jungleFig=null;
+            if(!TreeView)return;
+            if(stressGrove){stressGrove.Close();stressGrove=null;}
+            if(jungleFig){
+                jungleFig.gameObject.SetActive(false);
+                Destroy(jungleFig.gameObject);
+                jungleFig=null;
+            }
             GetComponent<MeshRenderer>().enabled=true;
             testSphere.gameObject.SetActive(restoreSphere);
-            if(obstacleObject)obstacleObject.SetActive(true);
+            if(obstacleObject)obstacleObject.SetActive(restoreObstacle);
             pivot=previousPivot;distance=previousDistance;PlaceCamera();
             lastClockTime=Time.realtimeSinceStartupAsDouble;
         }
@@ -111,6 +134,7 @@ namespace Foliage
         }
         void OnDestroy()
         {
+            if(stressGrove)stressGrove.Close();
             if(branchPanelSettings)Destroy(branchPanelSettings);
             if(branchFramePacing) QualitySettings.vSyncCount=previousVSync;
             ClearObstacle();
@@ -244,9 +268,9 @@ namespace Foliage
                 SimulationStep==null && SystemInfo.supportsAsyncGPUReadback;
             // Render/input can run while the GPU works. Synchronize when the next
             // fixed tick actually needs positions, or a caller requests a step.
-            if(!jungleFig && (!canQueue || paused || cutting || Sheet.ReadbackReady || accumulator+elapsed*speed>=step))
+            if(!TreeView && (!canQueue || paused || cutting || Sheet.ReadbackReady || accumulator+elapsed*speed>=step))
                 FinishQueuedTick();
-            if(!jungleFig && !paused && !cutting)
+            if(!TreeView && !paused && !cutting)
             {
                 // The queued solver can repay a brief stall over later renders.
                 // Keep elapsed time measured after fixture creation, including the first frame.
@@ -278,9 +302,9 @@ namespace Foliage
                 (Input.GetKey(KeyCode.E)?1:0)-(Input.GetKey(KeyCode.Q)?1:0),
                 (Input.GetKey(KeyCode.W)?1:0)-(Input.GetKey(KeyCode.S)?1:0));
             pivot+=view.transform.rotation*travel.normalized*(Time.unscaledDeltaTime*distance*.6f);
-            if(!grabbing && !movingSphere) distance=Mathf.Clamp(distance*Mathf.Exp(-scroll*.12f),.15f,jungleFig?view.farClipPlane*.8f:25);
+            if(!grabbing && !movingSphere) distance=Mathf.Clamp(distance*Mathf.Exp(-scroll*.12f),.15f,TreeView?view.farClipPlane*.8f:25);
             PlaceCamera();
-            if(jungleFig)return;
+            if(TreeView)return;
             var ray=view.ScreenPointToRay(mouse);
             if(Sheet!=null)
             {

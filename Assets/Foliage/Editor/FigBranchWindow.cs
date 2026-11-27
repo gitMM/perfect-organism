@@ -51,16 +51,10 @@ namespace Foliage.Editor
         }
         void Build(){
             Clear();
-            var shoots=new List<FigShoot>();
-            wood=JungleFig.Generate(seed,settings,shoots);
+            wood=FigBranchInstance.BuildTree(seed,settings,branches,validate:true);
             woodVertices=wood.vertices;woodTriangles=wood.triangles;
             bark=AssetDatabase.LoadAssetAtPath<Material>("Assets/Foliage/Fig Bark.mat");
             leaves=new Material(Resources.Load<Shader>("FigLeaf"));
-            foreach(var shoot in shoots){
-                shoot.geometry.Validate();
-                if(shoot.geometry.issues.Count>0)throw new InvalidOperationException(string.Join(", ",shoot.geometry.issues));
-                var branch=new FigBranchInstance(shoot);branches.Add(branch);branch.Activate();
-            }
             groundPlane=Resources.GetBuiltinResource<Mesh>("Plane.fbx");
             soil=new Material(Shader.Find("Standard")){color=new Color(.24f,.22f,.18f)};
             soil.SetFloat("_Glossiness",.08f);
@@ -123,7 +117,7 @@ namespace Foliage.Editor
             if(EditorApplication.isPlayingOrWillChangePlaymode){EditorGUILayout.HelpBox("Use the interactive fig prefab in Play Mode.",MessageType.Info);return;}
             if(stage==null)Build();
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
-            GUILayout.Label($"Seed {seed} · {branches.Count} physical boughs");
+            GUILayout.Label($"Seed {seed} ï¿½ {branches.Count} physical boughs");
             EditorGUILayout.EndHorizontal();
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
             if(GUILayout.Button("Previous",EditorStyles.toolbarButton))FocusBranch(focus-1);
@@ -136,7 +130,7 @@ namespace Foliage.Editor
             solverDebug=GUILayout.Toggle(solverDebug,"Tree solver debug view",EditorStyles.toolbarButton);
             EditorGUILayout.EndHorizontal();
             if(solverDebug)GUILayout.Label(FigBranchInstance.DebugLegend);
-            EditorGUILayout.HelpBox(grabbed==null?"Drag a bough, twig, or leaf. Right-drag to orbit. Scroll to zoom.":"Pulling crown • release to let the twig recover.",MessageType.None);
+            EditorGUILayout.HelpBox(grabbed==null?"Drag a bough, twig, or leaf. Right-drag to orbit. Scroll to zoom.":"Pulling crown ï¿½ release to let the twig recover.",MessageType.None);
             Rect rect=GUILayoutUtility.GetRect(100,100,GUILayout.ExpandWidth(true),GUILayout.ExpandHeight(true));
             var q=Quaternion.Euler(pitch,yaw,0);
             var camera=stage.camera;
@@ -158,7 +152,7 @@ namespace Foliage.Editor
             }
             if(e.type!=EventType.Repaint)return;
             stage.BeginPreview(rect,GUIStyle.none);
-            stage.DrawMesh(groundPlane,Matrix4x4.Scale(new Vector3(16,1,16)),soil,0);
+            stage.DrawMesh(groundPlane,Matrix4x4.TRS(Vector3.zero,Quaternion.FromToRotation(Vector3.up,(Vector3.up-settings.GroundGradient).normalized),new Vector3(16,1,16)),soil,0);
             stage.DrawMesh(wood,Matrix4x4.identity,bark,0);
             foreach(var b in branches){
                 var matrix=Matrix4x4.Translate(b.shoot.origin);

@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
@@ -94,20 +94,23 @@ namespace Foliage.Editor
                 camera.backgroundColor=new Color(.78f,.78f,.76f);
                 camera.clearFlags=CameraClearFlags.SolidColor;
                 camera.orthographic=true;
-                camera.orthographicSize=21.5f*settings.size;
-                Vector3 target=Vector3.up*13*settings.size;
+                float treeScale=settings.ScaleFor(seed);
+                Vector3 gradient=settings.GroundGradient;
+                camera.orthographicSize=21.5f*treeScale;
+                Vector3 target=Vector3.up*13*treeScale;
                 camera.transform.position=target+new Vector3(11,6,-48);
                 if(view!=View.WholeTree){
                     float side=view==View.TrailRear?-1:1;
                     camera.orthographic=false;
                     camera.fieldOfView=54;
-                    camera.transform.position=new Vector3(1.4f*side*settings.size,1.7f,-14*side*settings.size);
-                    target=Vector3.up*4.7f*settings.size;
+                    camera.transform.position=new Vector3(1.4f*side*treeScale,1.7f,-14*side*treeScale);
+                    camera.transform.position+=Vector3.up*Vector3.Dot(gradient,camera.transform.position);
+                    target=Vector3.up*4.7f*treeScale;
                 }
                 if(view==View.BarkDetail){
                     var points=mesh.vertices;
                     var normals=mesh.normals;
-                    Vector3 probe=new Vector3(-1.5f,1.65f,-5)*settings.size;
+                    Vector3 probe=new Vector3(-1.5f,1.65f,-5)*treeScale;
                     int index=0;
                     float nearest=float.PositiveInfinity;
                     for(int i=0;i<points.Length;i++){
@@ -133,12 +136,14 @@ namespace Foliage.Editor
                 var round=Resources.GetBuiltinResource<Mesh>("Sphere.fbx");
                 void Ellipsoid(Vector3 pos,Vector3 scale,Quaternion rot,Material mat)=>
                     stage.DrawMesh(round,Matrix4x4.TRS(pos,rot,scale*.5f),mat,0);
-                Ellipsoid(Vector3.down*.28f,new Vector3((view==View.WholeTree?40:110)*settings.size,.56f,(view==View.WholeTree?36:110)*settings.size),Quaternion.identity,ground);
-                Vector3 foot=new Vector3(5.4f,0,-3.8f)*settings.size;
+                var groundRotation=Quaternion.FromToRotation(Vector3.up,(Vector3.up-gradient).normalized);
+                Ellipsoid(groundRotation*(Vector3.down*.28f),new Vector3((view==View.WholeTree?40:110)*treeScale,.56f,(view==View.WholeTree?36:110)*treeScale),groundRotation,ground);
+                Vector3 foot=new Vector3(5.4f,0,-3.8f)*treeScale;
                 if(view!=View.WholeTree){
                     float direction=view==View.TrailRear?-1:1;
-                    foot=new Vector3(2.4f*direction,0,-7.2f*direction)*settings.size;
+                    foot=new Vector3(2.4f*direction,0,-7.2f*direction)*treeScale;
                 }
+                foot.y=Vector3.Dot(gradient,foot);
                 void Limb(Vector3 a,Vector3 b,float width){
                     Vector3 delta=b-a;
                     Ellipsoid(foot+(a+b)*.5f,new Vector3(width,delta.magnitude+width*.5f,width),Quaternion.FromToRotation(Vector3.up,delta),figure);

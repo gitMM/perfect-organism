@@ -18,7 +18,7 @@ namespace Foliage
         Label obstacleStats;
         VisualElement contactModels;
         float nextPanelUpdate;
-        bool CompactBranchPanel=>!jungleFig && Sheet?.plant!=null && settings.forked &&
+        bool CompactBranchPanel=>!TreeView && Sheet?.plant!=null && settings.forked &&
             sheetTab==0 && !expandBranchSettings;
 
         static void Highlight(Button button,bool selected)
@@ -53,7 +53,7 @@ namespace Foliage
             nextPanelUpdate=Time.unscaledTime+.15f;
             branchStats.text=$"{Sheet.Count} nodes   /   {Sheet.triangles.Length/3} faces\nTick {Sheet.Steps}    |    1/60 s";
             branchStats.text+=$"\n{Geometry.bladeRows.Count:N0} leaves";
-            if(settings.adaptivePhysics)branchStats.text+=$" · {settings.PlantCount-Geometry.coarsePlants} higher-detail plants";
+            if(settings.adaptivePhysics)branchStats.text+=$" ï¿½ {settings.PlantCount-Geometry.coarsePlants} higher-detail plants";
             branchContactStats.text=$"Branch contacts   {Sheet.selfContact.branchContacts}    Blade contacts   {Sheet.selfContact.bladeContacts}";
             if(settings.PlantCount>1)branchContactStats.text+=$"\nBetween plants   {Sheet.selfContact.betweenPlantContacts}";
             branchHint.text=Sheet.badVertex>=0?$"Non-finite solver value at node {Sheet.badVertex}":
@@ -127,6 +127,7 @@ namespace Foliage
             Control(modes,"Leaf",()=>OpenLeaf(leafIndex));
             Control(modes,"Stems",()=>{},true);
             if(jungleFigPrefab)Control(Row(),"Jungle fig",OpenJungleFig);
+            if(jungleFigPrefab)Control(Row(),"20-tree collision stress test",OpenTreeStressTest);
             debugButton=Control(Row(),"Debug rendering",()=>SetDebugRendering(!debugRendering),debugRendering);
             Control(Row(),TenCapsuleTest,()=>OpenCapsulePreset(10));
             hundredPreset=Control(Row(),HundredCapsuleTest,()=>OpenCapsulePreset(100));

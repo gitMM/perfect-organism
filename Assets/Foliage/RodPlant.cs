@@ -11,6 +11,7 @@ namespace Foliage
         public readonly PlantGeometry geometry;
         public readonly Vector3[] rest,skin;
         public readonly Quaternion[] restFrames,frames;
+        internal readonly Quaternion[] inverseRestFrames;
         public readonly int[] parent,skinTriangles;
         public readonly bool[] midrib;
         internal readonly int[] skinNode,skinRod,renderSlot;
@@ -24,11 +25,12 @@ namespace Foliage
         readonly float[] pickRadii;
         public int Ghost(int rod) => geometry.nodes.Count+rod;
         public RodPlant(PlantGeometry g):this(g,null,null){}
-        internal RodPlant(PlantGeometry g,RodPlant previous,PlantCut cut)
+        internal RodPlant(PlantGeometry g,RodPlant previous,PlantCut cut,bool trackCutNeighbors=true)
         {
             geometry=g;
             rest=new Vector3[g.nodes.Count+g.rods.Count]; g.nodes.CopyTo(rest);
             parent=new int[g.rods.Count]; frames=new Quaternion[parent.Length]; restFrames=new Quaternion[parent.Length];
+            inverseRestFrames=new Quaternion[parent.Length];
             renderSlot=new int[parent.Length];
             for(int i=0;i<renderSlot.Length;i++)
                 renderSlot[i]=previous==null?i:i>0 && cut.rodSource[i]==cut.rodSource[i-1]?
@@ -42,6 +44,7 @@ namespace Foliage
                 var side=Vector3.ProjectOnPlane(Mathf.Abs(axis.normalized.x)<.9f?Vector3.right:Vector3.forward,axis.normalized).normalized;
                 rest[Ghost(i)]=(rest[r.a]+rest[r.b])*.5f+side*(.5f*axis.magnitude);
                 restFrames[i]=frames[i]=Frame(rest,i);
+                inverseRestFrames[i]=Quaternion.Inverse(restFrames[i]);
             }
             midrib=new bool[rest.Length]; leafRod=new int[g.bladeRows.Count];
             for(int i=0;i<leafRod.Length;i++)
@@ -78,6 +81,7 @@ namespace Foliage
                     {
                         var shell=g.faces[f.face];skinNode[v]=j==0?shell.a:j==1?shell.b:shell.c;
                     }
+                    else if(previous==null)skinNode[v]=-1;
                     else
                     {
                         var rod=g.rods[f.rod];
@@ -95,13 +99,18 @@ namespace Foliage
                     BindTriangle(i);
                     if(g.surface[i].face>=0)shells.Add(i);
                 }
-                for(int i=0;i<g.surface.Count;i++)
+                for(int i=0;trackCutNeighbors && i<g.surface.Count;i++)
                 {
                     var f=g.surface[i];
                     if(f.rod<0)continue;
                     if(skinRod[f.a]!=f.rod)sharedRingNeighbor[f.a]=i;
                     if(skinRod[f.b]!=f.rod)sharedRingNeighbor[f.b]=i;
                     if(skinRod[f.c]!=f.rod)sharedRingNeighbor[f.c]=i;
+                }
+                for(int v=0;v<skin.Length;v++){
+                    if(skinNode[v]>=0)continue;
+                    var rod=g.rods[skinRod[v]];
+                    skinNode[v]=(g.skin[v]-rest[rod.a]).sqrMagnitude<(g.skin[v]-rest[rod.b]).sqrMagnitude?rod.a:rod.b;
                 }
             }
             else
@@ -130,7 +139,7 @@ namespace Foliage
                 skinRod[i]=0;skinNode[i]=g.rods[0].b;
             }
             for(int i=retained;i<skin.Length;i++)
-                if(skinRod[i]>=0)skinOffset[i]=Quaternion.Inverse(restFrames[skinRod[i]])*(g.skin[i]-rest[skinNode[i]]);
+                if(skinRod[i]>=0)skinOffset[i]=inverseRestFrames[skinRod[i]]*(g.skin[i]-rest[skinNode[i]]);
             int batches=(g.surface.Count+PickBatch-1)/PickBatch;
             pickAnchors=new int[batches][];pickRadii=new float[batches];
             if(previous!=null)

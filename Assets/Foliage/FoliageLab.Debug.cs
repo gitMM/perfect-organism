@@ -44,6 +44,16 @@ namespace Foliage
             GUI.color=Color.white;
             GUILayout.BeginArea(new Rect(0,0,PanelWidth,Screen.height/scale),GUI.skin.box);
             GUILayout.Label("<b>FOLIAGE  /  TEST SCENE</b>");
+            if(stressGrove){
+                GUILayout.Label("20-tree collision stress test");
+                GUILayout.Label($"Trees generated   {stressGrove.Trees} / {FigStressGrove.Count}");
+                GUILayout.Label($"Physics tick   {stressGrove.Tick}\nTrees in contact   {stressGrove.TreesInContact}\nContacting tree pairs   {stressGrove.ContactPairs}");
+                if(GUILayout.Button(stressGrove.Paused?"Resume physics":"Pause physics"))stressGrove.Paused=!stressGrove.Paused;
+                if(GUILayout.Button("Single step")){stressGrove.Paused=true;stressGrove.Step();}
+                if(stressGrove.Trees>0 && GUILayout.Button("Frame grove"))FrameBounds(stressGrove.TreeBounds);
+                if(GUILayout.Button("Back to lab"))CloseJungleFig();
+                GUILayout.EndArea();GUI.matrix=Matrix4x4.identity;return;
+            }
             if(jungleFig)
             {
                 GUILayout.Label("Jungle fig   /   Seed " + jungleFig.seed);
@@ -57,6 +67,7 @@ namespace Foliage
                 GUILayout.EndArea();GUI.matrix=Matrix4x4.identity;return;
             }
             if(jungleFigPrefab && GUILayout.Button("Jungle fig")){OpenJungleFig();GUIUtility.ExitGUI();}
+            if(jungleFigPrefab && GUILayout.Button("20-tree collision stress test")){OpenTreeStressTest();GUIUtility.ExitGUI();}
             int current=Sheet==null?0:Sheet.plant!=null?3:Sheet.leaf==null?1:2;
             int workspace=GUILayout.Toolbar(current,new[]{"Plant","Sheet","Leaf","Stems"});
             if(workspace!=current)
@@ -183,7 +194,7 @@ namespace Foliage
         static void Outline(Vector3 a,Vector3 b,Vector3 c) { Line(a,b); Line(b,c); Line(c,a); }
         void OnRenderObject()
         {
-            if(jungleFig || !debugRendering || Camera.current!=view || Geometry==null) return;
+            if(TreeView || !debugRendering || Camera.current!=view || Geometry==null) return;
             if(Sheet!=null) { DrawSheetOverlay(); return; }
             var g=Geometry;
             float r=.009f*debugScale;

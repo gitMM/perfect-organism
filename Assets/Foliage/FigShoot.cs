@@ -65,15 +65,25 @@ namespace Foliage
                 float t=i/(float)segments;
                 path.Add(g.Node((1-t)*(1-t)*start+2*(1-t)*t*control+t*t*end-origin));
             }
-            int firstRod=g.rods.Count;
-            g.Tube(path,0,radius,tip/radius,12);
-            for(int i=firstRod;i<g.rods.Count;i++){
+            WoodyTube(path,radius,tip/radius,12);
+            return path.ToArray();
+        }
+
+        // Ramp along the taper, segment by segment. The solver switches to an
+        // augmented material-frame joint once the rigidity gain reaches one.
+        internal static float WoodRigidityGain(float relativeRadius){
+            float maturity=Mathf.InverseLerp(.032f,.17f,relativeRadius);
+            return 11f*Mathf.SmoothStep(0,1,maturity);
+        }
+        void WoodyTube(List<int> path,float radius,float taper,int sides){
+            var g=geometry;
+            int first=g.rods.Count;
+            g.Tube(path,0,radius,taper,sides);
+            for(int i=first;i<g.rods.Count;i++){
                 var rod=g.rods[i];
-                float maturity=Mathf.InverseLerp(.10f,.45f,rod.radius/treeScale);
-                rod.woodRigidityGain=11f*Mathf.SmoothStep(0,1,maturity);
+                rod.woodRigidityGain=WoodRigidityGain(rod.radius/treeScale);
                 g.rods[i]=rod;
             }
-            return path.ToArray();
         }
 
         PlantGeometry.TwigCluster StartCluster(int anchor)=>new PlantGeometry.TwigCluster{
@@ -139,7 +149,7 @@ namespace Foliage
                     float t=j/5f;
                     spur.Add(g.Node(start+reach*(dir*t+Vector3.up*(.21f*Mathf.Sin(t*Mathf.PI)-.16f*t*t))));
                 }
-                g.Tube(spur,0,reach*.022f,.23f,8);
+                WoodyTube(spur,reach*.022f,.23f,8);
                 LeafyTwigCount++;
                 Vector3 fan=Vector3.Cross(Vector3.up,dir).normalized;
                 for(int j=1;j<=5;j++){
@@ -164,7 +174,7 @@ namespace Foliage
                 float t=j/(float)nodes;
                 path.Add(g.Node(start+length*(heading*t+Vector3.up*(droop*t*t+.13f*t*(1-t))+side*(curve*t*t))));
             }
-            g.Tube(path,0,Mathf.Clamp(length*.020f,.011f*treeScale,.038f*treeScale),.26f,6);
+            WoodyTube(path,Mathf.Clamp(length*.020f,.011f*treeScale,.038f*treeScale),.26f,6);
             var leafSettings=PlantSettings.Default;
             leafSettings.resolution=4;leafSettings.width=Range(.21f,.30f);leafSettings.curvature=Range(.25f,.5f);
             float bladeLength=Range(.27f,.40f)*treeScale;
@@ -258,8 +268,9 @@ namespace Foliage
         }
 
         public Mesh CreateMesh()=>CreateMesh(new MeshData(this));
-        internal Mesh CreateMesh(MeshData data){
+        internal Mesh CreateMesh(MeshData data,bool gpuSkin=false){
             var mesh=new Mesh{name="Fig twig and leaves",indexFormat=UnityEngine.Rendering.IndexFormat.UInt32};
+            if(gpuSkin)mesh.vertexBufferTarget|=GraphicsBuffer.Target.Raw;
             mesh.SetVertices(geometry.skin);mesh.SetColors(geometry.colors);
             mesh.SetUVs(0,data.grain);mesh.SetUVs(1,data.direction);mesh.SetUVs(2,data.age);
             mesh.subMeshCount=2;
@@ -326,7 +337,32 @@ namespace Foliage
             public VbdSheet solver;
             public Vector3 Center=>shoot.origin+mesh.bounds.center;
             public FigBranchInstance(FigShoot shoot){this.shoot=shoot;mesh=shoot.CreateMesh();}
-            internal FigBranchInstance(FigShoot shoot,FigShoot.MeshData data){this.shoot=shoot;mesh=shoot.CreateMesh(data);}
+            FigBranchInstance(FigShoot shoot,FigShoot.MeshData data){this.shoot=shoot;mesh=shoot.CreateMesh(data,true);}
+            public static Mesh BuildTree(int seed,FigSettings settings,List<FigBranchInstance> branches,
+                Vector3? groundGradient=null,bool validate=false){
+                var shoots=new List<FigShoot>();
+                var prepared=new System.Collections.Concurrent.ConcurrentDictionary<int,(FigShoot.MeshData mesh,VbdSheet solver)>();
+                var wood=JungleFig.Generate(seed,settings,shoots,(i,shoot)=>{
+                    if(validate){
+                        shoot.geometry.Validate();
+                        if(shoot.geometry.issues.Count>0)throw new InvalidOperationException(string.Join(", ",shoot.geometry.issues));
+                    }
+                    var rig=new RodPlant(shoot.geometry,null,null,trackCutNeighbors:false);
+                    // The interactive fig uses surface picking and grab constraints. Obstacle
+                    // and self contact belong to the collision demos' separate solvers.
+                    var solver=new VbdSheet(null,rig,true,obstacleContacts:false);
+                    solver.PrepareShellNormals();
+                    prepared[i]=(new FigShoot.MeshData(shoot),solver);
+                },groundGradient);
+                for(int i=0;i<shoots.Count;i++){
+                    prepared.TryRemove(i,out var data);
+                    var branch=new FigBranchInstance(shoots[i],data.mesh);
+                    branches.Add(branch);
+                    branch.Activate(data.solver);
+                    branch.EnableRuntimeSkin();
+                }
+                return wood;
+            }
             public void Activate(){
                 if(solver!=null)return;
                 rig??=new RodPlant(shoot.geometry);

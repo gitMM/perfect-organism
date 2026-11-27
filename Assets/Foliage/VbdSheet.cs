@@ -42,7 +42,6 @@ namespace Foliage
         struct FigAxisState { public Vector4 multiplierAndPenalty, initialError; }
         int figDualKernel;
         ComputeBuffer figDual;
-        struct Element { public int a,b,c,d; public float rest,angle,vein,materialScale; public int extra,kind; public Vector4 reference; }
         public readonly Vector3[] rest, positions;
         public readonly Sample[] samples;
         public readonly int[] colors, triangles;
@@ -67,14 +66,12 @@ namespace Foliage
         readonly int[] groupOffsets;
 
         public VbdSheet(LeafSurface leaf=null,RodPlant plant=null):this(leaf,plant,false){}
-        internal VbdSheet(LeafSurface leaf,RodPlant plant,bool deferUpload)
+        internal VbdSheet(LeafSurface leaf,RodPlant plant,bool deferUpload,bool obstacleContacts=true)
         {
             this.leaf=leaf;
             this.plant=plant;
-            if(plant!=null) contact=new PlantContact(plant.geometry);
+            if(plant!=null && obstacleContacts) contact=new PlantContact(plant.geometry);
             bool shell=leaf!=null || plant!=null;
-            bool[] rib=leaf?.midrib??plant?.midrib;
-            float Thickness(int node) => leaf!=null?leaf.thicknessRatio[node]:plant!=null?plant.geometry.thicknessRatio[node]:1f;
             rest=leaf?.rest??plant?.rest??new Vector3[Side*Side];
             positions=new Vector3[Count]; samples=new Sample[Count];
             motionStats=new Vector2[Count];
@@ -84,152 +81,55 @@ namespace Foliage
                 stretch=90; bend=.12f; dampingTime=.025f;
                 grabK=8; grabLimit=.6f; iterations=18;
             }
-            var elements=new List<Element>(plant==null?0:plant.geometry.faces.Count*4+plant.parent.Length*6);
-            var faces=new List<int>(plant==null?0:plant.geometry.faces.Count*3);
-            var firstOpposite=new Dictionary<Vector2Int,int>();
-            var mass=new float[Count];
-            if(!shell)for(int v=0;v<Count;v++)
-                rest[v]=new Vector3((v%Side-5)*Spacing,(5-v/Side)*Spacing,0);
-            void Add(int a,int b,int c,int d,float length)
-            {
-                float angle=0,vein=0;
-                if(c>=0 && shell)
-                {
-                    var e=(rest[d]-rest[c]).normalized;
-                    var n=Vector3.Cross(rest[c]-rest[a],rest[d]-rest[a]).normalized;
-                    var m=Vector3.Cross(rest[d]-rest[b],rest[c]-rest[b]).normalized;
-                    angle=Mathf.Atan2(Vector3.Dot(Vector3.Cross(n,m),e),Vector3.Dot(n,m));
-                    // Bending along the rib crosses hinges spanning the rib at each row.
-                    if(rib[c]!=rib[d] && (rib[a] || rib[b])) vein=1;
+            int faceCount=plant?.geometry.faces.Count??(leaf!=null?leaf.triangles.Length/3:2*(Side-1)*(Side-1));
+            triangles=new int[3*faceCount];
+            int templateSize=0;
+            if(plant!=null){
+                var faces=plant.geometry.faces;
+                for(int i=0;i<faces.Count;i++){
+                    var f=faces[i];triangles[3*i]=f.a;triangles[3*i+1]=f.b;triangles[3*i+2]=f.c;
                 }
-                else if(shell && rib[a] && rib[b]) vein=1;
-                // Membrane rigidity scales with thickness; flexural rigidity scales with its cube.
-                float scale=c<0?(Thickness(a)+Thickness(b))*.5f:Mathf.Pow((Thickness(c)+Thickness(d))*.5f,3);
-                elements.Add(new Element{a=a,b=b,c=c,d=d,extra=-1,rest=length,angle=angle,vein=vein,materialScale=scale});
-            }
-            void Edge(int a,int b,int opposite)
-            {
-                var key=new Vector2Int(Math.Min(a,b),Math.Max(a,b));
-                float length=Vector3.Distance(rest[a],rest[b]);
-                if(firstOpposite.TryGetValue(key,out int other)) Add(other,opposite,a,b,length);
-                else { firstOpposite.Add(key,opposite); edges.Add(key); Add(a,b,-1,-1,length); }
-            }
-            void Face(int a,int b,int c)
-            {
-                faces.Add(a); faces.Add(b); faces.Add(c);
-                float m=!shell?Density*Spacing*Spacing/6:
-                    .075f*Vector3.Cross(rest[b]-rest[a],rest[c]-rest[a]).magnitude*(Thickness(a)+Thickness(b)+Thickness(c))/18;
-                mass[a]+=m; mass[b]+=m; mass[c]+=m;
-                Edge(a,b,c); Edge(b,c,a); Edge(c,a,b);
-            }
-            if(plant!=null)
-            {
-                foreach(var f in plant.geometry.faces) Face(f.a,f.b,f.c);
-                AddRods(plant,elements,mass);
-                if(stiffFigJoints.Count>0)iterations=8;
-                for(int i=0;i<contact.features.Length;i++)
-                {
-                    var f=contact.features[i];
-                    elements.Add(new Element{a=f.a,b=f.b,c=f.c,d=-1,extra=-1,kind=4,rest=i});
-                }
-            }
-            else if(leaf!=null)
-                for(int i=0;i<leaf.triangles.Length;i+=3) Face(leaf.triangles[i],leaf.triangles[i+1],leaf.triangles[i+2]);
-            else for(int row=0;row<Side-1;row++)
-                for(int col=0;col<Side-1;col++)
-                {
+                if(!obstacleContacts && faces.Count>0)
+                    while(templateSize<triangles.Length && faces[templateSize/3].part==faces[0].part)templateSize+=3;
+            }else if(leaf!=null)leaf.triangles.CopyTo(triangles,0);
+            else{
+                for(int v=0;v<Count;v++)rest[v]=new Vector3((v%Side-5)*Spacing,(5-v/Side)*Spacing,0);
+                int t=0;
+                for(int row=0;row<Side-1;row++)for(int col=0;col<Side-1;col++){
                     int a=row*Side+col;
-                    Face(a,a+1,a+Side+1); Face(a,a+Side+1,a+Side);
+                    triangles[t++]=a;triangles[t++]=a+1;triangles[t++]=a+Side+1;
+                    triangles[t++]=a;triangles[t++]=a+Side+1;triangles[t++]=a+Side;
                 }
-            structuralCount=elements.Count-(contact?.features.Length??0);
-            triangles=faces.ToArray();
-            // Build the GPU's packed incidence table directly. Centerline terms come
-            // first, with generation order preserved within each part of a node's row.
+            }
+            var mass=new float[Count];
+            int contacts=contact?.features.Length??0;
+            // At most three springs, two supports and one rotation term per rod,
+            // plus three collar constraints per blade.
+            int capacity=triangles.Length+(plant==null?0:6*plant.parent.Length+3*plant.leafRod.Length)+contacts;
+            var elements=new VbdElement[capacity];
+            VbdSetup.BuildFaces(triangles,templateSize,rest,leaf?.thicknessRatio??plant?.geometry.thicknessRatio.ToArray(),
+                leaf?.midrib??plant?.midrib,mass,elements,edges,Density*Spacing*Spacing/6);
+            structuralCount=plant==null?triangles.Length:AddRods(plant,elements,triangles.Length,mass);
+            if(stiffFigJoints.Count>0)iterations=8;
+            for(int i=0;i<contacts;i++){
+                var f=contact.features[i];
+                elements[structuralCount+i]=new VbdElement{a=f.a,b=f.b,c=f.c,d=-1,extra=-1,kind=4,rest=i};
+            }
+            int elementCount=structuralCount+contacts;
+            if(plant!=null){
+                foreach(int v in plant.geometry.groundPins)colors[v]=-1;
+                var roots=plant.geometry.rootNodes;
+                for(int i=0;i<plant.parent.Length;i++){
+                    var r=plant.geometry.rods[i];
+                    if(roots.Count==0?i!=0:plant.parent[i]>=0 || !roots.Contains(r.a))continue;
+                    colors[r.a]=colors[r.b]=colors[plant.Ghost(i)]=-1;
+                }
+            }else for(int v=0;v<Count;v++)if(leaf==null?v<Side:leaf.clamped[v])colors[v]=-1;
             var offsets=new int[Count+1];
             var rodCounts=new int[Count];
-            for(int i=0;i<elements.Count;i++){
-                var e=elements[i];
-                offsets[e.a+1]++;offsets[e.b+1]++;
-                if(e.c>=0)offsets[e.c+1]++;
-                if(e.d>=0)offsets[e.d+1]++;
-                if(e.extra>=0)offsets[e.extra+1]++;
-                if(e.kind==1 && e.materialScale>0){rodCounts[e.a]++;rodCounts[e.b]++;}
-            }
-            for(int v=0;v<Count;v++)offsets[v+1]+=offsets[v];
-            var centers=(int[])offsets.Clone();
-            var others=new int[Count];
-            for(int v=0;v<Count;v++)others[v]=offsets[v]+rodCounts[v];
-            var flat=new int[offsets[Count]];
-            for(int i=0;i<elements.Count;i++){
-                var e=elements[i];
-                var next=e.kind==1 && e.materialScale>0?centers:others;
-                flat[next[e.a]++]=i;flat[next[e.b]++]=i;
-                if(e.c>=0)flat[next[e.c]++]=i;
-                if(e.d>=0)flat[next[e.d]++]=i;
-                if(e.extra>=0)flat[next[e.extra]++]=i;
-            }
-            // Each spring and each four-vertex hinge is a clique, including grab triangle edges.
-            Array.Fill(colors,-1);
-            var clamped=new HashSet<int>();
-            if(plant!=null)
-            {
-                clamped.UnionWith(plant.geometry.groundPins);
-                var roots=plant.geometry.rootNodes;
-                for(int i=0;i<plant.parent.Length;i++)
-                {
-                    var r=plant.geometry.rods[i];
-                    if(roots.Count==0?i!=0:!roots.Contains(r.a) || plant.parent[i]>=0)continue;
-                    clamped.Add(r.a);clamped.Add(r.b);clamped.Add(plant.Ghost(i));
-                }
-            }
-            var usedColors=new int[Count+1];
-            for(int v=0;v<Count;v++)
-            {
-                if(plant!=null ? clamped.Contains(v) :
-                    leaf==null?v<Side:leaf.clamped[v]) continue;
-                int mark=v+1;
-                for(int slot=offsets[v];slot<offsets[v+1];slot++)
-                {
-                    var e=elements[flat[slot]];
-                    usedColors[colors[e.a]+1]=mark;usedColors[colors[e.b]+1]=mark;
-                    if(e.c>=0) usedColors[colors[e.c]+1]=mark;
-                    if(e.d>=0) usedColors[colors[e.d]+1]=mark;
-                    if(e.extra>=0) usedColors[colors[e.extra]+1]=mark;
-                }
-                int color=0; while(usedColors[color+1]==mark) color++;
-                colors[v]=color; colorCount=Math.Max(colorCount,color+1);
-            }
+            colorCount=VbdSetup.Pack(elements,elementCount,offsets,rodCounts,colors,plant?.geometry.twigClusters.Count>0,
+                out var flat,out groupOffsets,out var groupNodes);
             for(int i=0;i<Count;i++)if(colors[i]<0)pins.Add(i);
-            // Pack each color into whole thread groups, in topology order for coherent reads.
-            groupOffsets=new int[colorCount+1];
-            // Adjacent lanes solve similar stencils; no dependencies exist within a color.
-            int[] order=null;
-            if(plant?.geometry.twigClusters.Count>0){
-                order=new int[Count];
-                var keys=new long[Count];
-                for(int v=0;v<Count;v++){
-                    int frames=0,shellTerms=0;
-                    for(int slot=offsets[v];slot<offsets[v+1];slot++){
-                        var kind=elements[flat[slot]].kind;
-                        if(kind==2 || kind==3)frames++;
-                        if(kind==0)shellTerms++;
-                    }
-                    order[v]=v;
-                    keys[v]=((long)frames<<48)+((long)shellTerms<<32)+v;
-                }
-                Array.Sort(keys,order);
-            }
-            for(int v=0;v<Count;v++)
-                if(colors[v]>=0)groupOffsets[colors[v]+1]++;
-            for(int group=0;group<colorCount;group++)
-                groupOffsets[group+1]=groupOffsets[group]+((groupOffsets[group+1]+63)/64)*64;
-            var groupNodes=new int[groupOffsets[colorCount]];
-            Array.Fill(groupNodes,-1);
-            var nextNode=(int[])groupOffsets.Clone();
-            for(int i=0;i<Count;i++){
-                int v=order==null?i:order[i];
-                if(colors[v]>=0)groupNodes[nextNode[colors[v]]++]=v;
-            }
 
             var localRanges=new List<PlantRange>();
             var localOrder=new List<int>();
@@ -291,7 +191,7 @@ namespace Foliage
             ComputeBuffer Buffer(string name,int count,int stride,Array data,params int[] kernels)
             {
                 var buffer=new ComputeBuffer(count,stride); buffers.Add(buffer);
-                if(data!=null) buffer.SetData(data);
+                if(data!=null) buffer.SetData(data,0,0,Math.Min(count,data.Length));
                 foreach(int kernel in kernels)
                 {
                     gpu.SetBuffer(kernel,name,buffer);
@@ -359,7 +259,7 @@ namespace Foliage
                     var inertia=Buffer("Inertia",Count,12,null,predict,relax,measure);
                     var baseMass=Buffer("Mass",Count,4,mass,relax,measure,prepareFall);
                     if(figClusterRelax>=0)BuildFigClusters(mass,baseMass);
-                    var elementBuffer=Buffer("Elements",elements.Count,56,elements.ToArray(),predict,relax,measure,cacheRestMotion,prepareFall);
+                    var elementBuffer=Buffer("Elements",elementCount,56,elements,predict,relax,measure,cacheRestMotion,prepareFall);
                     int jointCount=stiffFigJoints.Count;
                     figDual=Buffer("FigDual",Math.Max(1,3*jointCount),32,null,relax,measure);
                     if(jointCount>0){
@@ -411,16 +311,16 @@ namespace Foliage
             var upload=uploadTopology;uploadTopology=null;
             upload();
         }
-        void AddRods(RodPlant plant,List<Element> elements,float[] mass)
+        int AddRods(RodPlant plant,VbdElement[] elements,int count,float[] mass)
         {
             var rods=plant.geometry.rods; var p=plant.rest;
-            void Register(Element e)
+            void Register(VbdElement e)
             {
-                elements.Add(e);
+                elements[count++]=e;
             }
             void Spring(int a,int b,float stiffness,bool centerline=false)
             {
-                Register(new Element{kind=1,a=a,b=b,c=-1,d=-1,extra=-1,rest=Vector3.Distance(p[a],p[b]),angle=stiffness,materialScale=centerline?1:0});
+                Register(new VbdElement{kind=1,a=a,b=b,c=-1,d=-1,extra=-1,rest=Vector3.Distance(p[a],p[b]),angle=stiffness,materialScale=centerline?1:0});
             }
             // Identify the woody paths carrying the fig canopy, including its outer
             // scaffold. Aerial roots and leaf stalks keep their own materials.
@@ -454,7 +354,7 @@ namespace Foliage
                     if(n==3 || ancestor<twigStart[tip] || rods[ancestor].woodRigidityGain>=1){
                         var socket=rods[ancestor];
                         Vector3 offset=Quaternion.Inverse(plant.restFrames[ancestor])*(p[rods[tip].b]-p[socket.b]);
-                        Register(new Element{kind=3,a=socket.a,b=socket.b,c=plant.Ghost(ancestor),d=rods[tip].b,extra=-1,
+                        Register(new VbdElement{kind=3,a=socket.a,b=socket.b,c=plant.Ghost(ancestor),d=rods[tip].b,extra=-1,
                             rest=1.5f/compliance,reference=new Vector4(offset.x,offset.y,offset.z,0)});
                         break;
                     }
@@ -486,7 +386,7 @@ namespace Foliage
                         rootedTrunk[r.b]=baseRod;
                         var root=rods[baseRod];
                         Vector3 offset=Quaternion.Inverse(plant.restFrames[baseRod])*(p[r.b]-p[root.b]);
-                        Register(new Element{kind=3,a=root.a,b=root.b,c=plant.Ghost(baseRod),d=r.b,extra=-1,
+                        Register(new VbdElement{kind=3,a=root.a,b=root.b,c=plant.Ghost(baseRod),d=r.b,extra=-1,
                             rest=350f*len,reference=new Vector4(offset.x,offset.y,offset.z,0)});
                     }
                 }
@@ -500,10 +400,10 @@ namespace Foliage
                 // Kind 2 uses materialScale as a one-based AVBD joint slot (zero for elastic rods).
                 int jointSlot=0;
                 if(r.woodRigidityGain>=1f){
-                    stiffFigJoints.Add(elements.Count);
+                    stiffFigJoints.Add(count);
                     jointSlot=stiffFigJoints.Count;
                 }
-                Register(new Element{kind=2,a=previous.a,b=r.a,c=plant.Ghost(parent),d=r.b,extra=g,
+                Register(new VbdElement{kind=2,a=previous.a,b=r.a,c=plant.Ghost(parent),d=r.b,extra=g,
                     materialScale=jointSlot,rest=woodRigidity*flexuralRigidity/dual,reference=new Vector4(q.x,q.y,q.z,q.w)});
             }
             for(int i=0;i<plant.leafRod.Length;i++)
@@ -516,10 +416,11 @@ namespace Foliage
                     int v=row[j];
                     if(plant.geometry.severedCollars.Contains(v))continue;
                     Vector3 offset=Quaternion.Inverse(plant.restFrames[rod])*(p[v]-p[r.b]);
-                    Register(new Element{kind=3,a=r.a,b=r.b,c=plant.Ghost(rod),d=v,extra=-1,
+                    Register(new VbdElement{kind=3,a=r.a,b=r.b,c=plant.Ghost(rod),d=v,extra=-1,
                         rest=220,reference=new Vector4(offset.x,offset.y,offset.z,0)});
                 }
             }
+            return count;
         }
         public void Reset()
         {
@@ -977,21 +878,28 @@ namespace Foliage
                 int r=plant.skinRod[v];
                 renderBindings[v]=new Vector2Int(plant.skinNode[v],r<0?-1:plant.renderSlot[r]);
                 if(r<0)return;
-                localNormals[v]=Quaternion.Inverse(plant.restFrames[r])*restSkinNormals[v];
+                localNormals[v]=plant.inverseRestFrames[r]*restSkinNormals[v];
                 skinRadius=Mathf.Max(skinRadius,plant.skinOffset[v].magnitude);
             }
             for(int i=retained;i<skinCount;i++)BindVertex(i);
             foreach(int v in plant.rebound)BindVertex(v);
+            if(shellVertices==null)PrepareShellNormals();
+        }
+
+        internal void PrepareShellNormals()
+        {
             var shells=new List<int>();
             var triangles=plant.skinTriangles;
-            var vertexRows=new Dictionary<int,int>();
+            // Skin indices are dense. Store row + 1 so zero marks an unseen vertex.
+            var vertexRows=new int[plant.skin.Length];
             var counts=new List<int>();
             foreach(int f in plant.shells)for(int j=0;j<3;j++)
             {
                 int v=triangles[3*f+j];
-                if(!vertexRows.TryGetValue(v,out int row))
+                int row=vertexRows[v]-1;
+                if(row<0)
                 {
-                    row=counts.Count;vertexRows.Add(v,row);shells.Add(v);counts.Add(0);
+                    row=counts.Count;vertexRows[v]=row+1;shells.Add(v);counts.Add(0);
                 }
                 counts[row]++;
             }
@@ -1002,7 +910,7 @@ namespace Foliage
             foreach(int f in plant.shells)for(int j=0;j<3;j++)
             {
                 int i=f*3;
-                normalEdges[heads[vertexRows[triangles[i+j]]]++]=new Vector2Int(triangles[i+(j+1)%3],triangles[i+(j+2)%3]);
+                normalEdges[heads[vertexRows[triangles[i+j]]-1]++]=new Vector2Int(triangles[i+(j+1)%3],triangles[i+(j+2)%3]);
             }
         }
         public void BindRenderMesh(Mesh mesh)=>BindRenderMesh(mesh,null,null);

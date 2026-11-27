@@ -8,6 +8,9 @@ namespace Foliage
     {
         public int seed=2;
         public FigSettings settings=new();
+        [Tooltip("Use the surface under the trunk when a ground collider is present. Otherwise use the generator slope.")]
+        public bool sampleGround=true;
+        public LayerMask groundLayers=Physics.DefaultRaycastLayers;
         public Material bark;
         public Camera interactionCamera;
         readonly List<FigBranchInstance> crown=new();
@@ -37,13 +40,19 @@ namespace Foliage
         Vector3 grabOffset;
         Camera View=>interactionCamera?interactionCamera:Camera.main;
 
+        Vector3 GroundGradient(){
+            if(sampleGround){
+                Vector3 up=transform.up;
+                if(Physics.Raycast(transform.position+up*.5f,-up,out var hit,1f,groundLayers,QueryTriggerInteraction.Ignore)){
+                    // Plane normals transform as covectors, including non-uniform object scale.
+                    Vector3 normal=transform.localToWorldMatrix.transpose.MultiplyVector(hit.normal).normalized;
+                    if(normal.y>.01f)return new Vector3(-normal.x,0,-normal.z)/normal.y;
+                }
+            }
+            return settings.GroundGradient;
+        }
         void OnEnable(){
-            var shoots=new List<FigShoot>();
-            var prepared=new System.Collections.Concurrent.ConcurrentDictionary<int,(FigShoot.MeshData mesh,VbdSheet solver)>();
-            wood=JungleFig.Generate(seed,settings,shoots,(i,shoot)=>{
-                var rig=new RodPlant(shoot.geometry);
-                prepared[i]=(new FigShoot.MeshData(shoot),new VbdSheet(null,rig,true));
-            });
+            wood=FigBranchInstance.BuildTree(seed,settings,crown,GroundGradient());
             generated=new GameObject("Fig wood");
             generated.transform.SetParent(transform,false);
             generated.AddComponent<MeshFilter>().sharedMesh=wood;
@@ -51,12 +60,9 @@ namespace Foliage
             trunk=generated.AddComponent<MeshCollider>();trunk.sharedMesh=wood;
             leafMaterial=new Material(Resources.Load<Shader>("FigLeaf"));
             normalMaterials=new[]{bark,leafMaterial};
-            foreach(var shoot in shoots){
-                prepared.TryRemove(crown.Count,out var data);
-                var b=new FigBranchInstance(shoot,data.mesh);crown.Add(b);
-                b.Activate(data.solver);b.EnableRuntimeSkin();
+            foreach(var b in crown){
                 var go=new GameObject("Physical bough");
-                go.transform.SetParent(generated.transform,false);go.transform.localPosition=shoot.origin;
+                go.transform.SetParent(generated.transform,false);go.transform.localPosition=b.shoot.origin;
                 go.AddComponent<MeshFilter>().sharedMesh=b.mesh;
                 var renderer=go.AddComponent<MeshRenderer>();
                 renderer.sharedMaterials=normalMaterials;boughRenderers.Add(renderer);

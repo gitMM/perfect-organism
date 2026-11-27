@@ -5,9 +5,30 @@ using UnityEngine.Rendering;
 
 namespace Foliage
 {
+    public enum FigSize { BySeed, Small, Medium, Large }
+
     [Serializable]
     public class FigSettings
     {
+        public FigSize sizeClass = FigSize.BySeed;
+        [Range(0,45)] public float slopeDegrees;
+        [Tooltip("Uphill heading in local space, from +Z towards +X.")]
+        [Range(0,360)] public float uphillHeading;
+
+        public FigSize SizeFor(int seed) => sizeClass == FigSize.BySeed
+            ? (FigSize)(1 + (unchecked((uint)seed) % 3)) : sizeClass;
+        public float ScaleFor(int seed) => size * (SizeFor(seed) switch {
+            FigSize.Small => .14f, FigSize.Medium => .50f, _ => 1f
+        });
+        public Vector3 GroundGradient => Quaternion.Euler(0,uphillHeading,0) * Vector3.forward
+            * Mathf.Tan(Mathf.Clamp(slopeDegrees,0,45)*Mathf.Deg2Rad);
+        internal FigSettings ForGeneration(int seed){
+            var copy=(FigSettings)MemberwiseClone();
+            copy.sizeClass=SizeFor(seed);
+            copy.size=ScaleFor(seed);
+            return copy;
+        }
+
         [Range(.6f, 1.4f)] public float size = 1;
         [Range(.55f, 1.4f)] public float crownSpread = 1;
         [Range(.5f, 1.5f)] public float buttressReach = 1;
@@ -66,7 +87,11 @@ namespace Foliage
         }
         readonly List<Root> roots = new();
         readonly List<(Vector3 a,Vector3 b,float ra,float rb)> limbs = new();
-        readonly Vector3 lean;
+        readonly Vector3 lean, gradient;
+        float GroundHeight(Vector3 point)=>Vector3.Dot(gradient,point);
+        Vector3 FieldPoint(Vector3 point)=>point+Vector3.up*GroundHeight(point);
+        Vector3 FieldCoordinates(Vector3 point)=>point-Vector3.up*GroundHeight(point);
+
         readonly float baseHeight, footRadius, girth, spread;
         readonly float openness;
         readonly Vector3 passageSide;
@@ -74,9 +99,10 @@ namespace Foliage
         float Range(float a, float b) => Mathf.Lerp(a,b,(float)random.NextDouble());
         static Vector3 Radial(float angle) => new(Mathf.Cos(angle),0,Mathf.Sin(angle));
 
-        JungleFig(int seed, FigSettings settings)
+        JungleFig(int seed, FigSettings settings, Vector3 gradient)
         {
             this.settings=settings;
+            this.gradient=gradient;
             seedForFoliage=seed;
             uint hash=unchecked((uint)seed*2654435761u);
             hash^=hash>>16;
@@ -86,9 +112,21 @@ namespace Foliage
             girth=Range(1.0f,1.65f);
             spread=Range(.65f,1.35f)*settings.crownSpread;
             lean=Radial(Range(0,2*Mathf.PI))*Range(.15f,2.7f);
+            if(settings.sizeClass==FigSize.Small){
+                girth*=.23f;
+                lean*=.45f;
+                return;
+            }
+            bool developing=settings.sizeClass==FigSize.Medium;
+            if(developing){
+                girth*=.62f;
+                footRadius*=.17f;
+                lean*=.68f;
+            }
             // Shape choices use their own stream so root development preserves the crown.
             var lower=new System.Random(unchecked((int)(hash ^ 0x53b190a7u)));
             openness=Mathf.Clamp01((float)lower.NextDouble()*1.55f-.25f);
+            if(developing)openness*=.15f;
             float heading=((float)lower.NextDouble()-.5f)*1.05f;
             passageSide=Radial(heading);
             int count=random.Next(4,8);
@@ -106,9 +144,11 @@ namespace Foliage
         public static Mesh Generate(int seed, FigSettings settings,List<FigShoot> shoots)
             => Generate(seed,settings,shoots,null);
 
-        internal static Mesh Generate(int seed, FigSettings settings,List<FigShoot> shoots,Action<int,FigShoot> prepare)
+        internal static Mesh Generate(int seed, FigSettings settings,List<FigShoot> shoots,Action<int,FigShoot> prepare,Vector3? groundGradient=null)
         {
-            var fig=new JungleFig(seed,settings){shoots=shoots};
+            var gradient=groundGradient??settings.GroundGradient;
+            settings=settings.ForGeneration(seed);
+            var fig=new JungleFig(seed,settings,gradient){shoots=shoots};
             int firstShoot=shoots?.Count??0;
             fig.BuildCrown();
             fig.triangles.RemoveAll(index=>index<0);
@@ -144,13 +184,18 @@ namespace Foliage
         // flatten into buttress walls near soil and converge into a fluted column above.
         void BuildBase()
         {
+            if(settings.sizeClass==FigSize.Small){
+                Tube(Vector3.down*.42f,FieldPoint(lean*.25f+Vector3.up*(baseHeight*.5f)),
+                    FieldPoint(lean+Vector3.up*baseHeight),girth*1.35f,girth*.57f,forceRing:true);
+                return;
+            }
             const float step=.24f;
             float half=footRadius+10f*settings.buttressReach+lean.magnitude+2;
             float top=baseHeight+2;
             foreach(var limb in limbs){
                 foreach(var p in new[]{limb.a,limb.b}){
                     half=Mathf.Max(half,Mathf.Max(Mathf.Abs(p.x),Mathf.Abs(p.z))+limb.ra+1);
-                    top=Mathf.Max(top,p.y+limb.ra+2);
+                    top=Mathf.Max(top,FieldCoordinates(p).y+limb.ra*(1+gradient.magnitude)+2);
                 }
             }
             int n=Mathf.CeilToInt(2*half/step)+1;
@@ -210,13 +255,15 @@ namespace Foliage
             {
                 Vector3 axis=limb.b-limb.a;
                 float pad=Mathf.Max(limb.ra,limb.rb)+.65f;
-                Vector3 lo=(Vector3.Min(limb.a,limb.b)-Vector3.one*pad-origin)/step;
-                Vector3 hi=(Vector3.Max(limb.a,limb.b)+Vector3.one*pad-origin)/step;
+                Vector3 a=FieldCoordinates(limb.a),b=FieldCoordinates(limb.b);
+                Vector3 margin=new Vector3(1,1+gradient.magnitude,1)*pad;
+                Vector3 lo=(Vector3.Min(a,b)-margin-origin)/step;
+                Vector3 hi=(Vector3.Max(a,b)+margin-origin)/step;
                 for(int y=Mathf.Max(1,Mathf.FloorToInt(lo.y));y<=Mathf.Min(levels-1,Mathf.CeilToInt(hi.y));y++)
                 for(int z=Mathf.Max(0,Mathf.FloorToInt(lo.z));z<=Mathf.Min(n-1,Mathf.CeilToInt(hi.z));z++)
                 for(int x=Mathf.Max(0,Mathf.FloorToInt(lo.x));x<=Mathf.Min(n-1,Mathf.CeilToInt(hi.x));x++)
                 {
-                    Vector3 delta=origin+step*new Vector3(x,y,z)-limb.a;
+                    Vector3 delta=FieldPoint(origin+step*new Vector3(x,y,z))-limb.a;
                     float t=Mathf.Clamp01(Vector3.Dot(delta,axis)/axis.sqrMagnitude);
                     float r=Mathf.Lerp(limb.ra,limb.rb,t);
                     float d=(delta-t*axis).magnitude-r;
@@ -258,6 +305,10 @@ namespace Foliage
             float length=root.length*1.82f+.6f*settings.buttressReach;
             float curl=.2f+.23f*Mathf.Sin(root.phase);
             float shoulder=baseHeight*(.36f+.11f*Mathf.Cos(root.phase));
+            if(settings.sizeClass==FigSize.Medium){
+                length*=.43f;
+                shoulder*=.35f;
+            }
             Vector3 Path(float t)=>foot+outwards*(length*t)+lateral*(length*curl*
                 (Mathf.Sin(t*4+root.phase)-Mathf.Sin(root.phase))*.53f*t);
             const int spans=12;
@@ -317,7 +368,7 @@ namespace Foliage
             int[] corners={0,1,1+n,n,plane,plane+1,plane+1+n,plane+n};
             int[,] tetra={{0,1,2,6},{0,2,3,6},{0,3,7,6},{0,7,4,6},{0,4,5,6},{0,5,1,6}};
             var cache=new Dictionary<ulong,int>();
-            Vector3 Point(int i)=>origin+new Vector3(i%n,i/plane,(i/n)%n)*step;
+            Vector3 Point(int i)=>FieldPoint(origin+new Vector3(i%n,i/plane,(i/n)%n)*step);
             Vector3 Gradient(int i)
             {
                 int x=i%n,z=(i/n)%n,y=i/plane;
@@ -334,7 +385,8 @@ namespace Foliage
                 float t=f[a]/(f[a]-f[b]);
                 vertices.Add(Vector3.Lerp(Point(a),Point(b),t));
                 AddBark(BarkSample.Blend(bark[a],bark[b],t));
-                fieldNormals.Add(Vector3.Lerp(Gradient(a),Gradient(b),t).normalized);
+                Vector3 normal=Vector3.Lerp(Gradient(a),Gradient(b),t);
+                fieldNormals.Add((normal-gradient*normal.y).normalized);
                 cache.Add(key,v);
                 return v;
             }
@@ -376,16 +428,33 @@ namespace Foliage
 
         void BuildCrown()
         {
-            int leaders=random.Next(3,7);
+            if(settings.sizeClass==FigSize.Small){
+                // A sapling has one continuous leader, with short laterals at separate heights.
+                int count=random.Next(3,6);
+                float azimuth=Range(0,2*Mathf.PI);
+                for(int i=0;i<count;i++){
+                    bool leader=i==0;
+                    float t=leader?1f:Mathf.Lerp(.42f,.86f,(i-.5f)/(count-1));
+                    Vector3 start=FieldPoint(lean*(t*t)+Vector3.up*(baseHeight*t));
+                    Vector3 outward=Radial(azimuth+i*2.4f);
+                    Vector3 dir=(Vector3.up*(leader?1.6f:.75f)+outward*spread*(leader?.22f:1f)-gradient*.2f).normalized;
+                    Branch(start,dir,leader?Range(4f,5.5f):Range(2.8f,4.2f),girth*(leader?.56f:.32f),leader?3:2,false);
+                }
+                return;
+            }
+            int depth=settings.sizeClass==FigSize.Medium?4:5;
+            int leaders=random.Next(3,7)-(5-depth);
             float heading=Range(0,6.283f);
             for(int i=0;i<leaders;i++)
             {
                 float angle=heading+6.283f*(i+Range(-.2f,.2f))/leaders;
                 float h=i==0?baseHeight:baseHeight*Range(.57f,.98f);
-                Vector3 start=lean*Mathf.Pow(h/baseHeight,2)+Vector3.up*h;
+                Vector3 start=FieldPoint(lean*Mathf.Pow(h/baseHeight,2)+Vector3.up*h);
                 bool lateral=i==1 || (i>1 && Range(0,1)<.22f);
                 var dir=(Radial(angle)*(lateral?1.9f:Range(.38f,1.1f))*spread+Vector3.up*(lateral?.48f:1)).normalized;
-                Branch(start,dir,Range(5.3f,9.4f),girth*(i==0?.9f:Range(.51f,.8f)),5,lateral);
+                if(gradient.sqrMagnitude>0)
+                    dir=(dir+Vector3.up*Mathf.Max(0,GroundHeight(dir))-.20f*gradient).normalized;
+                Branch(start,dir,Range(5.3f,9.4f),girth*(i==0?.9f:Range(.51f,.8f)),depth,lateral);
             }
         }
 
@@ -393,6 +462,21 @@ namespace Foliage
         {
             Vector3 endDir=(dir+Vector3.up*Range(-.15f,.52f)+Radial(Range(0,6.28f))*.32f).normalized;
             Vector3 mid=start+dir*(length*.52f), end=mid+endDir*(length*.48f);
+            bool weighted=settings.sizeClass!=FigSize.Small;
+            if(weighted){
+                // A near-vertical leader carries its load axially. An outstretched
+                // bough bends most at its free end and passes that angle to its forks.
+                float reach=Vector3.ProjectOnPlane(end-start,Vector3.up).magnitude;
+                float weight=settings.sizeClass==FigSize.Large?.36f:.26f;
+                float drop=weight*reach*Mathf.Lerp(.55f,1f,Mathf.Clamp01(length/7f));
+                float clearance=Mathf.Max(.45f,2*radius);
+                float tipDrop=Mathf.Min(drop,end.y-GroundHeight(end)-clearance);
+                float midDrop=Mathf.Min(.25f*tipDrop,mid.y-GroundHeight(mid)-clearance);
+                mid.y-=midDrop;
+                end.y-=tipDrop;
+                Vector3 control=2*mid-(start+end)*.5f;
+                endDir=(end-control).normalized;
+            }
             if(shoot==null && shoots!=null){
                 // A short collar lies inside the trunk. Its end ring is the only
                 // fixed surface on this leader; every exposed span is a live rod.
@@ -424,6 +508,7 @@ namespace Foliage
                 Vector3 top=(1-t)*(1-t)*start+2*(1-t)*t*control+t*t*end;
                 top.y-=radius*.48f;
                 Vector3 foot=new Vector3(top.x,-.16f,top.z)+drift;
+                foot.y+=GroundHeight(foot);
                 float girth=Mathf.Clamp(radius*.13f,.045f,.13f);
                 if(shoot==null)Tube(top,Vector3.Lerp(top,foot,.5f)+drift*.18f,foot,girth,girth*.84f,true);
                 else aerial.Add((t,foot,girth,true));
@@ -435,7 +520,9 @@ namespace Foliage
                     float t=Range(.38f,.94f);
                     Vector3 control=mid*2-(start+end)*.5f;
                     Vector3 top=(1-t)*(1-t)*start+2*(1-t)*t*control+t*t*end;
-                    Vector3 tip=top-Vector3.up*(top.y*Range(.4f,.88f))+Radial(Range(0,6.28f))*.26f;
+                    float fractionToGround=Range(.4f,.88f);
+                    Vector3 tip=top-Vector3.up*(top.y*fractionToGround)+Radial(Range(0,6.28f))*.26f;
+                    tip.y+=GroundHeight(tip)*fractionToGround;
                     float rootRadius=Range(.018f,.045f);
                     if(shoot==null)Tube(top,Vector3.Lerp(top,tip,.5f)+dir*.12f,tip,rootRadius,.009f,true);
                     else aerial.Add((t,tip,rootRadius,false));
@@ -458,7 +545,7 @@ namespace Foliage
                 float attachmentT=.5f+.5f*fraction;
                 if(ringMesh && i==1)
                     ShapeSideOutlet(section,path,attachmentT,start,mid,end,Mathf.Lerp(radius,tipRadius,attachmentT));
-                if(shoots!=null || ringMesh){
+                if(weighted || shoots!=null || ringMesh){
                     float t=attachmentT;
                     if(shoot!=null){
                         node=path[i==0?section.rings:section.rings-2];
@@ -482,7 +569,9 @@ namespace Foliage
                     float d=(shoot.geometry.nodes[node]+shoot.origin-center*settings.size).sqrMagnitude;
                     if(d<closest){best=node;closest=d;}
                 }
-                shoot.AddAerialRoot(best,(root.tip-center)*settings.size,root.radius*settings.size,root.rooted,root.tip.y*settings.size);
+                Vector3 drop=(root.tip-center)*settings.size;
+                Vector3 actualTip=shoot.origin+shoot.geometry.nodes[best]+drop;
+                shoot.AddAerialRoot(best,drop,root.radius*settings.size,root.rooted,GroundHeight(actualTip)-.16f*settings.size);
             }
         }
 
